@@ -29,11 +29,22 @@ where
     Err(e) => return Err(e),
   };
 
+  if block_size < BGZF_HEADER_SIZE + TRAILER_SIZE {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidData,
+      format!(
+        "expected clen >= {}, got {}",
+        BGZF_HEADER_SIZE + TRAILER_SIZE,
+        block_size
+      ),
+    ));
+  }
+
   let cdata_len = block_size - BGZF_HEADER_SIZE - TRAILER_SIZE;
   cdata.resize(cdata_len, Default::default());
   reader.read_exact(cdata)?;
 
-  read_trailer(reader)?;
+  let ulen = read_trailer(reader)?;
 
   block.set_len(block_size as u64);
 

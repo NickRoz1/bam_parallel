@@ -202,7 +202,7 @@ impl<T: Read + Send + 'static> ParallelReader<T> {
                                         .send(work_unit)
                                         .expect("FLUME channel interaction failed.");
                                 }
-                                Err(_) => panic!("Failed to fetch block."),
+                                Err(e) => panic!("Failed to fetch block, error: {}", e),
                             }
                         }
                         Ok(MessageToController::Suspend(suspend_type)) => {
