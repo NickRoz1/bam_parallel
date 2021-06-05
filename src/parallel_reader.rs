@@ -9,6 +9,7 @@ struct WorkUnit {
     // Number of this WorkUnit in parsed blocks "queue". Less the number - sooner
     // the contents loaded into the buffer block.
     number: usize,
+    // TODO: preallocate blocks
     cdata: Vec<u8>,
     block: Block,
     block_size: usize,
