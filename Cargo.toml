@@ -13,3 +13,4 @@ num_cpus = "0.2"
 flume = "0.10.0"
 rayon = "1.5.1"
 tempdir = "0.3.7"
+gbam_tools = { git = "https://github.com/nickroz1/gbam" }

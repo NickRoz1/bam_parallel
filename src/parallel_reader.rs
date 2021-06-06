@@ -1,5 +1,7 @@
 use super::{fetch_block, inflate_data, Block};
+use byteorder::{LittleEndian, ReadBytesExt};
 use flume;
+use flume::{Receiver, TryRecvError};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::io::{self, Read};
@@ -80,6 +82,15 @@ pub struct ParallelReader<T> {
     work_unit_processor_t: flume::Sender<MessageToController>,
     block_buffer: Block,
     position: u64,
+    // Hold size of next block. If the read method is called, this variable is
+    // set to NONE. Because the reader does not necessarily implement SEEK trait
+    // (and its shared between threads which makes it difficult to manipulate
+    // it), this variable caches the value of last call to read_block_size(),
+    // since it modifies the reader making it impossible to read the value again
+    // without unwinding the cursor (needs SEEK trait). If read() is called,
+    // this nullifies since it is assumed that read_block_size() is always
+    // called before reading.
+    next_block_size: Option<usize>,
 }
 
 impl<T: Read + Send + 'static> ParallelReader<T> {
@@ -266,12 +277,62 @@ impl<T: Read + Send + 'static> ParallelReader<T> {
             // TODO: Buffer_BLOCK NOT BLOCK BUFFER
             block_buffer: Default::default(),
             position: 0,
+            next_block_size: None,
+        }
+    }
+}
+
+/// Used to peek on channel, to determine what is there without consuming the value.
+/// https://stackoverflow.com/a/59448553
+pub struct TryIterResult<'a, T: 'a> {
+    rx: &'a Receiver<T>,
+}
+
+pub fn try_iter_result<'a, T>(rx: &'a Receiver<T>) -> TryIterResult<'a, T> {
+    TryIterResult { rx: &rx }
+}
+
+impl<'a, T> Iterator for TryIterResult<'a, T> {
+    type Item = Result<T, TryRecvError>;
+
+    fn next(&mut self) -> Option<Result<T, TryRecvError>> {
+        match self.rx.try_recv() {
+            Ok(data) => Some(Ok(data)),
+            Err(TryRecvError::Empty) => Some(Err(TryRecvError::Empty)),
+            Err(TryRecvError::Disconnected) => None,
+        }
+    }
+}
+
+impl<T> ParallelReader<T> {
+    /// This function advances file reader cursor!
+    pub fn read_block_size(&mut self) -> std::io::Result<usize> {
+        if self.next_block_size.is_none() {
+            let block_size = match self.read_u32::<LittleEndian>() {
+                Ok(blocksize) => blocksize as usize,
+                Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
+                Err(e) => return Err(e),
+            };
+            self.next_block_size = Some(block_size);
+        }
+        return Ok(self.next_block_size.unwrap());
+    }
+
+    pub fn empty(&self) -> bool {
+        match try_iter_result(&self.consumer_r).peekable().peek() {
+            Some(Ok(None)) => true,
+            Some(Ok(Some(_))) => false,
+            Some(Err(_)) => false,
+            None => panic!("Channel is disconnected."),
         }
     }
 }
 
 impl<T> Read for ParallelReader<T> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Either the next block size is being read or block itself
+        // is being read, making old value unnecessary.
+        self.next_block_size = None;
         // Attempt to fill buf from current block
         match self.block_buffer.data_mut().read(buf) {
             // Block exhausted, get new.

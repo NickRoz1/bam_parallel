@@ -1,43 +1,50 @@
+use crate::ParallelReader;
+use crate::{GIGA_BYTE_SIZE, MEGA_BYTE_SIZE};
+use flume::{Receiver, Sender};
+use gbam_tools::BAMRawRecord;
 use rayon::{self, ThreadBuilder, ThreadPoolBuilder};
-use crate::{MEGA_BYTE_SIZE, GIGA_BYTE_SIZE};
-use flume::{Sender, Receiver};
 use std::cmp::{max, min};
-use tempdir::TempDir;
 use std::fs::File;
+use std::io::Read;
+use std::ops::Deref;
+use std::path::PathBuf;
+use tempdir::TempDir;
 
 /// This struct manages buffer for unsorted reads
 struct RecordsBuffer {
     mem_limit: usize,
-    records: Vec<RawRecord>,
+    records_bytes: Vec<u8>,
+    records: // ? BamRecord should be able own and borrow underlying data to own as true wrapper struct
 }
 
 impl RecordsBuffer {
     pub fn new(mem_limit: usize) -> Self {
         RecordsBuffer {
             mem_limit,
+            records_bytes: vec![0; mem_limit],
         }
     }
 
     pub fn clear(&mut self) {
-        self.records.clear();
+        self.records_bytes.clear();
     }
 
-    pub fn fill<R>(&mut self, reader: R) {
-        let mut mem_consumption: usize = 0;
-        while let Some(rec) = reader.next() {
-            mem_consumption += rec.byte_size();
-            self.records.push(rec);
-            // Buffer is filled
-            if mem_consumption > self.mem_limit {
+    pub fn fill<R>(&mut self, reader: &mut ParallelReader<R>) {
+        let mut last_byte_offset: usize = 0;
+        loop {
+            let block_size = reader.read_block_size().unwrap();
+            if last_byte_offset + block_size > self.mem_limit {
+                // Buffer has been filled.
                 break;
             }
+            let buf = &mut self.records_bytes[last_byte_offset..last_byte_offset + block_size];
+            reader.read_exact(buf).unwrap();
         }
     }
 }
 
-
 struct Sorter<R, W> {
-    reader: R,
+    reader: ParallelReader<R>,
     sorted_sink: W,
     thread_pool: rayon::ThreadPool,
     mem_limit: usize,
@@ -48,63 +55,81 @@ struct Sorter<R, W> {
     tmp_file_counter: usize,
 }
 
-impl<R, W> Sorter<R,W> {
-    /// There is no try_reserve container functionality in Rust yet, that means
-    /// that if the allocation will fail the program using sort functionality
-    /// will also crash with panic!. The memory limit should be chosen.
-    /// carefully.
-    pub fn new(mem_limit: usize, reader: R, sorted_sink: W, tmp_dir_path: std::path::PathBuf, out_compr_level: usize, thread_num: usize) -> Self {
-        let (buf_send, buf_recv) = flume::unbounded();
-        thread_num = max(min(num_cpus::get(), thread_num), 1);
-        let thread_pool = ThreadPoolBuilder::new().num_threads(thread_num).build().unwrap();
-        let tmp_dir = TempDir::new_in(tmp_dir_path, "BAM sort temporary directory.").unwrap();
-        Sorter {
-            reader,
-            sorted_sink,
-            thread_pool,
-            mem_limit,
-            out_compr_level, 
-            buf_send,
-            buf_recv,
-            tmp_dir,
-            tmp_file_counter: 0,
-        }
+pub fn sort_bam<R: Read + Send + 'static, W>(
+    mem_limit: usize,
+    reader: R,
+    sorted_sink: W,
+    tmp_dir_path: PathBuf,
+    out_compr_level: usize,
+    mut decompress_thread_num: usize,
+    mut reader_thread_num: usize,
+) -> std::io::Result<()> {
+    let decompress_thread_num = max(min(num_cpus::get(), decompress_thread_num), 1);
+    let reader_thread_num = max(min(num_cpus::get(), reader_thread_num), 1);
 
+    let parallel_reader = ParallelReader::new(reader, reader_thread_num);
+
+    let tmp_file_num = read_split_sort_dump_chunks(
+        &mut parallel_reader,
+        mem_limit,
+        decompress_thread_num,
+        tmp_dir_path,
+    );
+}
+
+fn read_split_sort_dump_chunks<R: Read + Send + 'static>(
+    reader: &mut ParallelReader<R>,
+    mem_limit: usize,
+    decompress_thread_num: usize,
+    tmp_dir_path: PathBuf,
+) -> usize {
+    let (buf_send, buf_recv) = flume::unbounded();
+    let mut recs_buf = Some(RecordsBuffer::new(mem_limit / 2));
+
+    buf_send.send(RecordsBuffer::new(mem_limit / 2));
+    let tmp_dir = TempDir::new_in(tmp_dir_path, "BAM sort temporary directory.").unwrap();
+
+    let thread_pool = ThreadPoolBuilder::new()
+        .num_threads(decompress_thread_num)
+        .build()
+        .unwrap();
+
+    let temp_files_counter: usize = 0;
+
+    // Load first chunk to start the cycle.
+    if !reader.empty() {
+        recs_buf.unwrap().fill(&mut reader);
+        thread_pool.spawn(|| sort_chunk(recs_buf.take().unwrap(), buf_send.clone()));
+        // While one buffer is being sorted this one will be loaded with data.
+        recs_buf = Some(RecordsBuffer::new(mem_limit / 2));
+    } else {
+        // Empty file
+        return 0;
+    }
+    while !reader.empty() {
+        recs_buf.unwrap().clear();
+        recs_buf.unwrap().fill(&mut reader);
+
+        thread_pool.spawn(|| sort_chunk(recs_buf.take().unwrap(), buf_send.clone()));
+        recs_buf = Some(buf_recv.recv().unwrap());
+
+        let temp_file = make_tmp_file(&temp_files_counter.to_string(), &tmp_dir).unwrap();
+        dump(recs_buf.as_ref().unwrap(), temp_file).unwrap();
     }
 
-    fn read_split_sort_dump_chunks(&mut self) {
-        let mut recs_buf = Some(RecordsBuffer::new(self.mem_limit / 2));
-        // Preload replacement. While one buffer is sorted this one will be loaded with data.
-        self.buf_send.send(RecordsBuffer::new(self.mem_limit / 2));
+    let last_buf = buf_recv.recv().unwrap();
+    let temp_file = make_tmp_file(&temp_files_counter.to_string(), &tmp_dir).unwrap();
+    dump(&last_buf, temp_file).unwrap();
+    temp_files_counter += 1;
 
-        while !self.reader.empty() {
-            recs_buf.unwrap().clear();
-            recs_buf.unwrap().fill(&mut self.reader);
-            
-            self.thread_pool.spawn(|| sort_chunk(recs_buf.take().unwrap(), buf_sender));
-            recs_buf = Some(self.buf_recv.recv().unwrap());
+    return temp_files_counter;
+}
 
-            self.dump(recs_buf.as_deref().unwrap());
-        }
+fn dump(buf: &RecordsBuffer, mut file: File) -> std::io::Result<()> {}
 
-        let last_buf = self.buf_recv.recv().unwrap();
-        self.dump(last_buf);
+fn sort_chunk(buf: RecordsBuffer, buf_send: Sender<RecordsBuffer>) {}
 
-
-    }
-
-    fn dump(&mut self, buf: &RecordsBuffer) {
-        let mut tmp_file = self.make_tmp_file(self.tmp_file_counter.to_string());
-        self.tmp_file_counter += 1;
-
-    }
-
-    fn sort_chunk(buf: RecordsBuffer, buf_send: Sender<RecordsBuffer>) {
-
-    }    
-
-    fn make_tmp_file(&self, file_name: &str) -> std::io::Result<std::fs::File> {
-        let file_path = self.tmp_dir.path().join(file_name);
-        File::create(file_path)
-    }
+fn make_tmp_file(file_name: &str, tmp_dir: &TempDir) -> std::io::Result<std::fs::File> {
+    let file_path = tmp_dir.path().join(file_name);
+    File::create(file_path)
 }
