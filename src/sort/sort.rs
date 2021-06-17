@@ -6,7 +6,6 @@ use gbam_tools::BAMRawRecord;
 use lz4_flex;
 use rayon::prelude::ParallelSliceMut;
 use rayon::{self, ThreadPoolBuilder};
-use reorder::reorder_index;
 
 use super::comparators::{
     compare_coordinates_and_strand, compare_read_names, compare_read_names_and_mates,
@@ -14,8 +13,9 @@ use super::comparators::{
 use std::borrow::BorrowMut;
 use std::cell::RefCell;
 use std::cmp::{max, min, Ordering};
+use std::collections::BinaryHeap;
 use std::fs::File;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::mem;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -87,6 +87,7 @@ pub enum SortBy {
     CoordinatesAndStrand,
 }
 
+/// Memory limit won't be strictly obeyed, but it probably won't be overflowed significantly.
 pub fn sort_bam<R: Read + Send + 'static, W>(
     mem_limit: usize,
     reader: R,
@@ -156,10 +157,14 @@ fn read_split_sort_dump_chunks<R: Read + Send + 'static>(
         recs_buf = Some(buf_recv.recv().unwrap());
 
         let file_name = temp_files_counter.to_string();
-        let temp_file = make_tmp_file(&file_name, &tmp_dir).unwrap();
+        let mut temp_file = make_tmp_file(&file_name, &tmp_dir).unwrap();
+        dump(
+            recs_buf.as_ref().unwrap(),
+            &mut temp_file,
+            compress_temp_files,
+        )
+        .unwrap();
         temp_files.push(temp_file);
-
-        dump(recs_buf.as_ref().unwrap(), temp_file, compress_temp_files).unwrap();
         temp_files_counter += 1;
     }
 
@@ -168,8 +173,8 @@ fn read_split_sort_dump_chunks<R: Read + Send + 'static>(
     // only one chunk in file) it's written straight to the resulting file, but
     // it's probably not worth it.
     let file_name = temp_files_counter.to_string();
-    let temp_file = make_tmp_file(&temp_files_counter.to_string(), &tmp_dir).unwrap();
-    dump(&last_buf, temp_file, compress_temp_files).unwrap();
+    let mut temp_file = make_tmp_file(&temp_files_counter.to_string(), &tmp_dir).unwrap();
+    dump(&last_buf, &mut temp_file, compress_temp_files).unwrap();
     temp_files.push(temp_file);
 
     // Ensure all buffered data is written
@@ -180,7 +185,7 @@ fn read_split_sort_dump_chunks<R: Read + Send + 'static>(
     return temp_files;
 }
 
-fn dump(buf: &RecordsBuffer, file: File, compress_temp_files: bool) -> std::io::Result<()> {
+fn dump(buf: &RecordsBuffer, file: &mut File, compress_temp_files: bool) -> std::io::Result<()> {
     let mut buf_writer = BufWriter::new(file);
     if compress_temp_files {
         let mut wrt = lz4_flex::frame::FrameEncoder::new(buf_writer);
@@ -203,35 +208,39 @@ fn write<W: Write>(buf: &RecordsBuffer, writer: &mut W) -> std::io::Result<()> {
 
 // For each byte range construct record wrapper, sort records and then reorder
 // the ranges to then write byte ranges into file in sorted order.
-fn sort_chunk(buf: RecordsBuffer, buf_return: Sender<RecordsBuffer>, sort_by: SortBy) {
+fn sort_chunk(mut buf: RecordsBuffer, buf_return: Sender<RecordsBuffer>, sort_by: SortBy) {
     let mut record_wrappers: Vec<(BAMRawRecord, Range<usize>)> = buf
         .records
-        .into_iter()
+        .iter()
         .map(|range| {
             (
                 BAMRawRecord(std::borrow::Cow::Borrowed(
                     &buf.records_bytes[range.start..range.end],
                 )),
-                range,
+                range.clone(),
             )
         })
         .collect();
-    &record_wrappers[..].par_sort_by(get_comparator(sort_by));
+    &record_wrappers[..].par_sort_by(get_tuple_comparator(sort_by));
     // The BAMRawRecords and their corresponding ranges are now in
     // order. Replace original ranges with the sorted ones.
     buf.records = record_wrappers.into_iter().map(|rec| rec.1).collect();
     buf_return.send(buf).unwrap();
 }
 
-fn get_comparator(
+fn get_tuple_comparator(
     sort_by: SortBy,
 ) -> impl Fn(&(BAMRawRecord, Range<usize>), &(BAMRawRecord, Range<usize>)) -> Ordering {
-    let cmp = match sort_by {
+    let cmp = get_comparator(sort_by);
+    move |a, b| cmp(&a.0, &b.0)
+}
+
+fn get_comparator(sort_by: SortBy) -> Comparator {
+    match sort_by {
         SortBy::Name => compare_read_names,
         SortBy::NameAndMatchMates => compare_read_names_and_mates,
         SortBy::CoordinatesAndStrand => compare_coordinates_and_strand,
-    };
-    move |a, b| cmp(&a.0, &b.0)
+    }
 }
 
 fn make_tmp_file(file_name: &str, tmp_dir: &TempDir) -> std::io::Result<std::fs::File> {
@@ -239,25 +248,110 @@ fn make_tmp_file(file_name: &str, tmp_dir: &TempDir) -> std::io::Result<std::fs:
     File::create(file_path)
 }
 
+type Comparator = fn(&BAMRawRecord, &BAMRawRecord) -> Ordering;
 // Struct which manages reading chunks from files
-struct ChunkReader<R>
-where
-    R: Read,
-{
-    inner: R,
-    cur_rec: Vec<u8>,
+struct ChunkReader {
+    inner: BufReader<File>,
+    buf: Option<Vec<u8>>,
+    // There would be some problems with lifetimes if doing it this way. Before
+    // putting ChunkReaders into min heap next_rec has to be called, and it
+    // borrows the self while the ChunkReader is moved into min_heap.
+    // rec: Option<BAMRawRecord<'a>>
+
+    // This field is used to order peeked records in
+    // BinaryHeap. One can create wrapper structs and define Ord and PartialOrd
+    // traits for them, and then just pass generic parameters to BinaryHeap
+    // instead of this. But this solution is simpler.
+    comparator: Comparator,
 }
 
-impl<R> ChunkReader<R> {
-    // Returns how many bytes were read
-    pub fn next_rec(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+impl ChunkReader {
+    // Creates new ChunkReader for temp file.
+    pub fn new(tmp_file: File, mem_limit: usize, comparator: Comparator) -> Self {
+        let mut chunk_reader = Self {
+            inner: BufReader::with_capacity(mem_limit, tmp_file),
+            buf: Some(Vec::new()),
+            comparator,
+        };
+        // Preload first record.
+        chunk_reader
+            .next_rec()
+            .expect("Temp file exists but it's empty.");
+        chunk_reader
+    }
+    // Reads bytes from inner reader into inner buffer, discarding previous record.
+    pub fn next_rec<'a>(&'a mut self) -> std::io::Result<Option<BAMRawRecord<'a>>> {
         // Needed to check whether EOF is reached.
-        let len_buf: [u8; 8] = [0; 8];
-        if self.inner.read(len_buf)? == 0 {
+        let mut len_buf: [u8; 8] = [0; 8];
+        if self.inner.read(&mut len_buf[..])? == 0 {
             // EOF reached.
-            return Ok(0);
+            self.buf = None;
+            return Ok(None);
         }
-        let data_len = len_buf.read_u64::<LittleEndian>()?;
+        let data_len = (&len_buf[..]).read_u64::<LittleEndian>()?;
+        let rec_buf = self.buf.as_mut().unwrap();
+        rec_buf.resize(data_len as usize, 0);
+        self.inner.read_exact(&mut rec_buf[..])?;
+        Ok(Some(BAMRawRecord(std::borrow::Cow::Borrowed(&rec_buf[..]))))
+    }
+
+    // Return reference to last loaded BAMRawRecord or None if the reader reached EOF.
+    pub fn peek<'a>(&'a self) -> Option<BAMRawRecord<'a>> {
+        self.buf
+            .as_ref()
+            .and_then(|buf| Some(BAMRawRecord(std::borrow::Cow::Borrowed(&buf[..]))))
+    }
+}
+
+impl PartialEq for ChunkReader {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.comparator)(&self.peek().unwrap(), &other.peek().unwrap()) {
+            Ordering::Equal => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ChunkReader {}
+
+// WARNING: the assumption is made that A < B and B < C means A < C
+impl PartialOrd for ChunkReader {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some((self.comparator)(
+            &self.peek().unwrap(),
+            &other.peek().unwrap(),
+        ))
+    }
+}
+impl Ord for ChunkReader {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.comparator)(&self.peek().unwrap(), &other.peek().unwrap())
+    }
+}
+
+// This struct handles merging of N sorted streams.
+struct NWayMerger {
+    // The ChunkReaders cache records and have peek() in their API, so it's
+    // possible to choose what record should go first (they contain record
+    // inside themselves).
+    min_heap: BinaryHeap<ChunkReader>,
+}
+
+impl NWayMerger {
+    pub fn new(chunks_readers: Vec<ChunkReader>) -> Self {
+        let mut min_heap = BinaryHeap::new();
+        chunks_readers
+            .into_iter()
+            .for_each(|chunk_reader| min_heap.push(chunk_reader));
+        Self { min_heap }
+    }
+    /// Returns next record in order to merge. None if no more records left.
+    pub fn get_next_rec(&mut self) -> Option<BAMRawRecord> {
+        if self.min_heap.is_empty() {
+            return None;
+        }
+        let cur_rec = self.min_heap.peek().unwrap().peek();
+        self.min_heap.peek().unwrap().next_rec();
     }
 }
 
@@ -269,4 +363,13 @@ fn merge_sorted_chunks_and_write<W: Write>(
 ) -> std::io::Result<()> {
     let num_chunks = tmp_files.len();
     let input_buf_mem_limit = min(16 * MEGA_BYTE_SIZE, mem_limit / 4 / num_chunks);
+
+    // ChunkReader might allocate more than allowed, because there is an inner
+    // buffer (not the reader buffer) which temporarily holds read record.
+    let chunks_readers: Vec<ChunkReader> = tmp_files
+        .into_iter()
+        .map(|tmp_file| ChunkReader::new(tmp_file, input_buf_mem_limit, get_comparator(sort_by)))
+        .collect();
+
+    Ok(())
 }
