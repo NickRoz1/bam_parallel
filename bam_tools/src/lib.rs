@@ -3,10 +3,10 @@ pub mod gz;
 mod parallel_reader;
 mod util;
 mod virtual_position;
-mod sort {
+pub mod sort {
     mod comparators;
     mod flags;
-    mod sort;
+    pub mod sort;
 }
 
 use block::Block;
@@ -15,7 +15,7 @@ use std::mem;
 use util::{fetch_block, inflate_data};
 use virtual_position::VirtualPosition;
 
-pub(crate) const MEGA_BYTE_SIZE: usize = 1024 * 1024;
+pub const MEGA_BYTE_SIZE: usize = 1024 * 1024;
 pub(crate) const GIGA_BYTE_SIZE: usize = 1024 * MEGA_BYTE_SIZE;
 const U64_SIZE: usize = mem::size_of::<u64>();
 const U32_SIZE: usize = mem::size_of::<u32>();

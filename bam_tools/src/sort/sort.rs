@@ -57,16 +57,18 @@ impl RecordsBuffer {
     pub fn fill<R>(&mut self, reader: &mut ParallelReader<R>) {
         self.clear();
         let mut last_byte_offset: usize = 0;
-        let mut buf = &mut self.records_bytes[..];
         loop {
             let block_size = reader.read_block_size().unwrap();
             // We have to read at least something in the buffer, hence '> 0' check.
             if last_byte_offset > 0 && last_byte_offset + block_size > self.mem_limit {
                 // Buffer has been filled.
+
                 break;
             }
+
+            self.records_bytes.resize(last_byte_offset + block_size, 0);
             reader
-                .read_exact(&mut buf[last_byte_offset..last_byte_offset + block_size])
+                .read_exact(&mut self.records_bytes[last_byte_offset..])
                 .unwrap();
             // Push the range of bytes which this record occupies
             self.records
@@ -77,7 +79,7 @@ impl RecordsBuffer {
 }
 
 /// Which comparator to choose for sorting
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum SortBy {
     Name,
     NameAndMatchMates,
