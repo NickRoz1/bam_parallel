@@ -4,135 +4,132 @@ use crate::util::{fetch_block, inflate_data};
 // This module preparses GBAM blocks to parallelize decompression
 use super::util;
 use flume::{Receiver, Sender};
-use rayon::ThreadPool;
-use std::collections::VecDeque;
-use std::io::{Read, Seek, SeekFrom};
-use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use rayon::{spawn, ThreadPool};
+use std::cmp::{Ord, Ordering, PartialEq, PartialOrd};
+use std::collections::BinaryHeap;
+use std::io::Read;
 
 enum Status {
     Success(Block),
     EOF,
 }
 
-struct ReaderGuard {
-    last_access: usize,
-    reader: Box<dyn Read + Send + 'static>,
-}
+struct Task(usize, Status);
 
-impl ReaderGuard {
-    pub fn get_task_num(&mut self) -> usize {
-        let task_num = self.last_access;
-        self.last_access += 1;
-        task_num
-    }
-
-    pub fn get_inner(&mut self) -> &mut Box<dyn Read + Send + 'static> {
-        &mut self.reader
+impl Ord for Task {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Smallest go first.
+        other.0.cmp(&self.0)
     }
 }
+
+impl PartialOrd for Task {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        // Smallest go first.
+        Some(self.cmp(other))
+    }
+}
+
+impl Eq for Task {}
+
+impl PartialEq for Task {
+    fn eq(&self, other: &Self) -> bool {
+        // There shouldn't be two WorkUnits with the same number in the Heap
+        assert_ne!(self.0, other.0);
+        false
+    }
+}
+
 /// Prefetches and decompresses GBAM blocks
 pub(crate) struct Readahead {
-    // Reader which will source compressed data.
-    inner: Arc<Mutex<ReaderGuard>>,
     // Decompressing threadpool.
     pool: ThreadPool,
-    // Used to hold free buffers.
-    read_bufs_recv: Receiver<Vec<u8>>,
-    // Used to return buffer.
-    read_bufs_send: Sender<Vec<u8>>,
-    sender: Sender<Status>,
-    receiver: Receiver<Status>,
-    reached_eof: Arc<AtomicBool>,
-    cvar_task_num: Arc<(Mutex<usize>, Condvar)>,
+    used_block_sender: Sender<Block>,
+    ready_to_processing_rx: Receiver<Status>,
 }
 
 impl Readahead {
-    pub fn new(thread_num: usize, reader: Box<dyn Read + Send + 'static>) -> Self {
-        let (sender, receiver) = flume::unbounded();
+    pub fn new(thread_num: usize, mut reader: Box<dyn Read + Send + 'static>) -> Self {
         let (read_bufs_send, read_bufs_recv) = flume::unbounded();
-        (0..thread_num).for_each(|_| read_bufs_send.send(Vec::new()).unwrap());
-        Self {
-            pool: rayon::ThreadPoolBuilder::new()
-                .num_threads(thread_num)
-                .build()
-                .unwrap(),
-            inner: Arc::new(Mutex::new(ReaderGuard {
-                reader,
-                last_access: 0,
-            })),
-            read_bufs_send,
-            read_bufs_recv,
-            sender,
-            receiver,
-            reached_eof: Arc::new(AtomicBool::new(false)),
-            cvar_task_num: Arc::new((Mutex::new(0), Condvar::new())),
+        let (used_block_sender, used_block_receiver) = flume::unbounded();
+        let (completed_task_tx, sorting_blocks_rx) = flume::unbounded();
+        let (ready_tasks_tx, ready_to_processing_rx) = flume::unbounded();
+
+        for _ in 0..thread_num {
+            read_bufs_send.send(Vec::new()).unwrap();
+            used_block_sender.send(Block::default()).unwrap();
         }
-    }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(thread_num)
+            .build()
+            .unwrap();
 
-    /// Creates task to parse block at position of certain size
-    pub fn prefetch_block(&mut self, mut block: Block) {
-        let arc_reader_guard = self.inner.clone();
-        let buf_sender = self.read_bufs_send.clone();
-        let send_res = self.sender.clone();
-        let cvar = self.cvar_task_num.clone();
-        let mut read_buf = self.read_bufs_recv.recv().unwrap();
-        let eof_reached_flag = Arc::clone(&self.reached_eof);
-
-        self.pool.spawn(move || {
-            if eof_reached_flag.load(Ordering::SeqCst) == true {
-                return;
-            }
-            let mut reader_guard = arc_reader_guard.lock().unwrap();
-            let cur_task_num = reader_guard.get_task_num();
-
-            let bytes_count =
-                fetch_block(reader_guard.get_inner(), &mut read_buf, &mut block).unwrap();
-
-            if bytes_count == 0 {
-                // Reached EOF.
-                eof_reached_flag.swap(true, Ordering::SeqCst);
-                let (lock, cvar) = &*cvar;
-
-                let mut waiting_for_task_num = lock.lock().unwrap();
-
-                while *waiting_for_task_num != cur_task_num {
-                    waiting_for_task_num = cvar.wait(waiting_for_task_num).unwrap();
+        // Ordering thread.
+        pool.install(|| {
+            spawn(move || {
+                // The heap is needed for cases when the blocks are not inflated in
+                // proper order (as coming from input stream).
+                let mut block_heap = BinaryHeap::<Task>::new();
+                // Number of current block (ordered as read from input stream).
+                let mut cur_block_num = 0;
+                while let Ok(work_unit) = sorting_blocks_rx.recv() {
+                    block_heap.push(work_unit);
+                    // Fill queue with parsed blocks.
+                    while !block_heap.is_empty() && (block_heap.peek().unwrap().0 == cur_block_num)
+                    {
+                        ready_tasks_tx.send((block_heap.pop().unwrap()).1).unwrap();
+                        // The block is extracted. Wait for next one.
+                        cur_block_num += 1;
+                    }
                 }
-                send_res.send(Status::EOF).unwrap();
-                buf_sender.send(read_buf).unwrap();
-
-                *waiting_for_task_num += 1;
-                cvar.notify_all();
-                return;
-            }
-            // Release mutex guard since reader is not needed anymore.
-            drop(reader_guard);
-
-            decompress_block(&read_buf[..], &mut block);
-
-            // We don't need this buffer anymore, leave it for other threads.
-            buf_sender.send(read_buf).unwrap();
-
-            let (lock, cvar) = &*cvar;
-
-            let mut waiting_for_task_num = lock.lock().unwrap();
-            while *waiting_for_task_num != cur_task_num {
-                waiting_for_task_num = cvar.wait(waiting_for_task_num).unwrap();
-            }
-            send_res.send(Status::Success(block)).unwrap();
-            *waiting_for_task_num += 1;
-            cvar.notify_all();
+            })
         });
+        // Reading thread.
+        pool.install(|| {
+            spawn(move || {
+                let mut cur_task: usize = 0;
+                while let Ok(mut block) = used_block_receiver.recv() {
+                    let mut read_buf = read_bufs_recv.recv().unwrap();
+                    let bytes_count = fetch_block(&mut reader, &mut read_buf, &mut block).unwrap();
+
+                    let task_ready_to_sort_tx = completed_task_tx.clone();
+                    if bytes_count == 0 {
+                        task_ready_to_sort_tx
+                            .send(Task(cur_task, Status::EOF))
+                            .unwrap();
+                        // Reached EOF
+                        return;
+                    }
+
+                    let read_buf_sender = read_bufs_send.clone();
+                    spawn(move || {
+                        decompress_block(&mut read_buf, &mut block);
+                        task_ready_to_sort_tx
+                            .send(Task(cur_task, Status::Success(block)))
+                            .unwrap();
+                        if !read_buf_sender.is_disconnected() {
+                            read_buf_sender.send(read_buf);
+                        }
+                    });
+                    cur_task += 1;
+                }
+            })
+        });
+        Self {
+            pool,
+            used_block_sender,
+            ready_to_processing_rx,
+        }
     }
 
     /// Receives prefetched block. This is a blocking function. In case there is
     /// no uncompressed blocks in queue, the thread which called it will be
     /// blocked until uncompressed buffer appears.
     pub fn get_block(&mut self, old_buf: Block) -> Option<Block> {
-        self.prefetch_block(old_buf);
-        match self.receiver.recv().unwrap() {
+        if !self.used_block_sender.is_disconnected() {
+            self.used_block_sender.send(old_buf).unwrap();
+        }
+        match self.ready_to_processing_rx.recv().unwrap() {
             Status::Success(block) => Some(block),
             Status::EOF => None,
         }

@@ -13,11 +13,8 @@ pub struct Reader {
 
 impl Reader {
     pub fn new<RSS: Read + Send + 'static>(inner: RSS, thread_num: usize) -> Self {
-        assert!(thread_num > 0 && thread_num < num_cpus::get());
+        assert!(thread_num > 0 && thread_num <= num_cpus::get());
         let mut readahead = Readahead::new(thread_num, Box::new(inner));
-        for _ in 0..thread_num {
-            readahead.prefetch_block(Block::default());
-        }
         Self {
             readahead,
             block_buffer: Some(Block::default()),
@@ -27,13 +24,6 @@ impl Reader {
 
 impl Read for Reader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let p = self.block_buffer.as_mut().unwrap();
-        // println!("Current bgzf block size = {}", p.data_mut().get_ref().len());
-        // Attempt to fill buf from current block.
-        // println!("Requested {} bytes", buf.len());
-        if buf.len() == 14 {
-            // println!("Got something weird");
-        }
         match self.block_buffer.as_mut().unwrap().data_mut().read(buf) {
             // Block exhausted, get new.
             Ok(0) => {
