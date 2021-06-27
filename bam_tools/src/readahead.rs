@@ -43,7 +43,6 @@ impl PartialEq for Task {
 /// Prefetches and decompresses GBAM blocks
 pub(crate) struct Readahead {
     // Decompressing threadpool.
-    pool: ThreadPool,
     used_block_sender: Sender<Block>,
     ready_to_processing_rx: Receiver<Status>,
 }
@@ -65,58 +64,54 @@ impl Readahead {
             .unwrap();
 
         // Ordering thread.
-        pool.install(|| {
-            spawn(move || {
-                // The heap is needed for cases when the blocks are not inflated in
-                // proper order (as coming from input stream).
-                let mut block_heap = BinaryHeap::<Task>::new();
-                // Number of current block (ordered as read from input stream).
-                let mut cur_block_num = 0;
-                while let Ok(work_unit) = sorting_blocks_rx.recv() {
-                    block_heap.push(work_unit);
-                    // Fill queue with parsed blocks.
-                    while !block_heap.is_empty() && (block_heap.peek().unwrap().0 == cur_block_num)
-                    {
-                        ready_tasks_tx.send((block_heap.pop().unwrap()).1).unwrap();
-                        // The block is extracted. Wait for next one.
-                        cur_block_num += 1;
-                    }
+        pool.spawn(move || {
+            // The heap is needed for cases when the blocks are not inflated in
+            // proper order (as coming from input stream).
+            let mut block_heap = BinaryHeap::<Task>::new();
+            // Number of current block (ordered as read from input stream).
+            let mut cur_block_num = 0;
+            while let Ok(work_unit) = sorting_blocks_rx.recv() {
+                block_heap.push(work_unit);
+                // Fill queue with parsed blocks.
+                while !block_heap.is_empty() && (block_heap.peek().unwrap().0 == cur_block_num) {
+                    ready_tasks_tx.send((block_heap.pop().unwrap()).1).unwrap();
+                    // The block is extracted. Wait for next one.
+                    cur_block_num += 1;
                 }
-            })
+            }
         });
         // Reading thread.
-        pool.install(|| {
-            spawn(move || {
-                let mut cur_task: usize = 0;
-                while let Ok(mut block) = used_block_receiver.recv() {
-                    let mut read_buf = read_bufs_recv.recv().unwrap();
-                    let bytes_count = fetch_block(&mut reader, &mut read_buf, &mut block).unwrap();
+        pool.spawn(move || {
+            let mut cur_task: usize = 0;
+            while let Ok(mut block) = used_block_receiver.recv() {
+                let mut read_buf = read_bufs_recv.recv().unwrap();
+                let bytes_count = fetch_block(&mut reader, &mut read_buf, &mut block).unwrap();
 
-                    let task_ready_to_sort_tx = completed_task_tx.clone();
-                    if bytes_count == 0 {
-                        task_ready_to_sort_tx
-                            .send(Task(cur_task, Status::EOF))
-                            .unwrap();
-                        // Reached EOF
-                        return;
-                    }
-
-                    let read_buf_sender = read_bufs_send.clone();
-                    spawn(move || {
-                        decompress_block(&mut read_buf, &mut block);
-                        task_ready_to_sort_tx
-                            .send(Task(cur_task, Status::Success(block)))
-                            .unwrap();
-                        if !read_buf_sender.is_disconnected() {
-                            read_buf_sender.send(read_buf);
-                        }
-                    });
-                    cur_task += 1;
+                let task_ready_to_sort_tx = completed_task_tx.clone();
+                if bytes_count == 0 {
+                    task_ready_to_sort_tx
+                        .send(Task(cur_task, Status::EOF))
+                        .unwrap();
+                    // Reached EOF
+                    return;
                 }
-            })
+
+                let read_buf_sender = read_bufs_send.clone();
+
+                spawn(move || {
+                    decompress_block(&mut read_buf, &mut block);
+                    task_ready_to_sort_tx
+                        .send(Task(cur_task, Status::Success(block)))
+                        .unwrap();
+                    if !read_buf_sender.is_disconnected() {
+                        read_buf_sender.send(read_buf).unwrap();
+                    }
+                });
+
+                cur_task += 1;
+            }
         });
         Self {
-            pool,
             used_block_sender,
             ready_to_processing_rx,
         }

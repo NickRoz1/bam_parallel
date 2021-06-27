@@ -1,10 +1,8 @@
-use flate2::read;
-
 use crate::block::Block;
 use std::io;
 
 use super::readahead::Readahead;
-use std::{io::Read, os::unix::thread};
+use std::io::Read;
 
 pub struct Reader {
     readahead: Readahead,
@@ -14,7 +12,7 @@ pub struct Reader {
 impl Reader {
     pub fn new<RSS: Read + Send + 'static>(inner: RSS, thread_num: usize) -> Self {
         assert!(thread_num > 0 && thread_num <= num_cpus::get());
-        let mut readahead = Readahead::new(thread_num, Box::new(inner));
+        let readahead = Readahead::new(thread_num, Box::new(inner));
         Self {
             readahead,
             block_buffer: Some(Block::default()),
