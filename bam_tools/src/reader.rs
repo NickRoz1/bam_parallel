@@ -1,6 +1,7 @@
 mod readahead;
 mod records;
 
+use crate::block;
 use crate::block::Block;
 use crate::MAGIC_NUMBER;
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -28,17 +29,29 @@ impl Reader {
     }
 
     pub fn read_record(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
-        let block_size = match self.read_u32::<LittleEndian>() {
+        buf.clear();
+        self.append_record(buf)
+    }
+
+    // Resizes the buffer so an additional record can fit in the end and fills this empty section.
+    pub fn append_record(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        let block_size = self.read_block_size();
+
+        let prev_len = buf.len();
+        buf.resize(prev_len + block_size, 0);
+
+        self.read_exact(&mut buf[prev_len..prev_len + block_size])
+            .expect("Failed to read.");
+
+        Ok(block_size)
+    }
+
+    fn read_block_size(&mut self) -> usize {
+        match self.read_u32::<LittleEndian>() {
             Ok(bs) => bs as usize,
             Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
             Err(e) => panic!("{}", e),
-        };
-
-        buf.resize(block_size, 0);
-
-        self.read_exact(buf).expect("FAILED TO READ.");
-
-        Ok(block_size)
+        }
     }
 
     pub fn records(&mut self) -> Records<'_> {

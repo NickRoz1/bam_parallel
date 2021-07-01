@@ -14,6 +14,6 @@ flume = "0.10.0"
 rayon = "1.5.1"
 tempdir = "0.3.7"
 # gbam_tools = { git = "https://github.com/nickroz1/gbam" }
-gbam_tools = { path = "/home/nickr/Development/Rust/GBAM/gbam_tools/" }
+# gbam_tools = { path = "/home/nickr/Development/Rust/GBAM/gbam_tools/" }
 lz4_flex = "0.8.2"
 bitflags = "1.2.1"

@@ -1,4 +1,4 @@
-use crate::{ParallelReader, MEGA_BYTE_SIZE};
+use crate::{Reader, MEGA_BYTE_SIZE};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use flume::Sender;
 use gbam_tools::BAMRawRecord;
@@ -54,7 +54,7 @@ impl RecordsBuffer {
         self.records_bytes.clear();
     }
 
-    pub fn fill<R>(&mut self, reader: &mut ParallelReader<R>) {
+    pub fn fill<R>(&mut self, reader: &mut Reader) {
         self.clear();
         let mut last_byte_offset: usize = 0;
         loop {
@@ -62,7 +62,6 @@ impl RecordsBuffer {
             // We have to read at least something in the buffer, hence '> 0' check.
             if last_byte_offset > 0 && last_byte_offset + block_size > self.mem_limit {
                 // Buffer has been filled.
-
                 break;
             }
 
@@ -101,7 +100,7 @@ pub fn sort_bam<R: Read + Send + 'static, W: Write>(
     let decompress_thread_num = max(min(num_cpus::get(), sort_thread_num), 1);
     let reader_thread_num = max(min(num_cpus::get(), reader_thread_num), 1);
 
-    let mut parallel_reader = ParallelReader::new(reader, reader_thread_num);
+    let mut parallel_reader = Reader::new(reader, reader_thread_num);
 
     let tmp_files = read_split_sort_dump_chunks(
         &mut parallel_reader,
@@ -116,8 +115,8 @@ pub fn sort_bam<R: Read + Send + 'static, W: Write>(
     Ok(())
 }
 
-fn read_split_sort_dump_chunks<R: Read + Send + 'static>(
-    reader: &mut ParallelReader<R>,
+fn read_split_sort_dump_chunks(
+    reader: &mut Reader,
     mem_limit: usize,
     sort_thread_num: usize,
     tmp_dir_path: PathBuf,
@@ -285,10 +284,10 @@ impl ChunkReader {
 
 type Comparator = fn(&BAMRawRecord, &BAMRawRecord) -> Ordering;
 
-// Comparator field is used to order records in
-// BinaryHeap. One can create wrapper structs and define Ord and PartialOrd
-// traits for them, and then just pass generic parameters to BinaryHeap
-// instead of this. But this solution is simpler.
+// Comparator field is used to order records in BinaryHeap. One can create
+// wrapper structs and define Ord and PartialOrd traits for them, and then just
+// pass generic parameters to BinaryHeap instead of this. But this solution is
+// simpler.
 struct MergeCandidate<'a>(BAMRawRecord<'a>, usize, &'a Comparator);
 
 impl<'a> PartialEq for MergeCandidate<'a> {
