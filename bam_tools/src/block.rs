@@ -48,6 +48,10 @@ impl Block {
         &mut self.data
     }
 
+    pub fn get_len(&self) -> usize {
+        self.data.get_ref().len()
+    }
+
     /// Returns whether the cursor is at the end of the uncompressed data.
     fn is_eof(&self) -> bool {
         let len = self.data.get_ref().len() as u64;

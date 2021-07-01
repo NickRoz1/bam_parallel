@@ -1,8 +1,20 @@
-import subprocess
 import os
 import pathlib
-import tempfile
+import test_suites
+import subprocess
 from urllib.request import urlretrieve
+
+
+class bam_parallel_binary:
+    def __init__(self, binary_path):
+        self.binary_path = binary_path
+
+    def exec(self, command, quiet=True):
+        if quiet:
+            command += "-q"
+        res = subprocess.run([self.binary_path] + command, capture_output=True)
+        assert res.returncode == 0, res
+        return res.stdout.strip().decode("utf-8")
 
 
 # Generates md5 has sum via calling md5sum CLI
@@ -13,51 +25,7 @@ def get_file_md5_sum(file_path):
     return md5sum
 
 
-class test_tuple:
-    def __init__(self, source_url, reference_hash, meta) -> None:
-        self.source_url = source_url
-        self.ref_hash = reference_hash
-        self.meta = meta
-
-
-def run_bam_parallel_and_check(path, command):
-    res = subprocess.run([binary_path, "-q"] + command, capture_output=True)
-    # Empty res means it has been run successfully since it's in quite mode
-    print(res)
-    assert res.returncode == 0
-
-
-# MD5 test hash is generated for reference file generated via calling
-# ../bin/sambamba-0.8.0-linux-amd64-static sort -t2 -n -M -m 300K match_mates.bam -o match_mates_nameSorted.bam
-def test_match_mate_sort(binary_path, test_files):
-    reference_hash = "a92acaf18901832885ae8c3d2fe696f0"
-    temp_file = tempfile.NamedTemporaryFile()
-    run_bam_parallel_and_check(
-        binary_path,
-        [
-            "-n",
-            "-M",
-            "-i{}".format(test_files[0].name),
-            "-o{}".format(temp_file.name),
-        ],
-    )
-    return (
-        get_file_md5_sum(temp_file.name) == "a92acaf18901832885ae8c3d2fe696f0"
-    )
-
-
-# Map containing test routines and files needed for them
-tests = {
-    test_match_mate_sort: [
-        (
-            "match_mates.bam",
-            "https://github.com/biod/sambamba/raw/master/test/match_mates.bam",
-        )
-    ]
-}
-
-
-def fetch_if_does_not_exist(file_path):
+def fetch_if_does_not_exist(file_name, file_path, file_url):
     if not os.path.exists(file_path):
         print(
             "Downloading test file <{}> for <{}> test suite.".format(
@@ -68,20 +36,61 @@ def fetch_if_does_not_exist(file_path):
         print("Download completed.")
 
 
+class test_tuple:
+    def __init__(self, test_dir, file_name, source_url, reference_hash) -> None:
+        self.file_name = file_name
+        self.source_url = source_url
+        self.ref_hash = reference_hash
+        self.path = os.path.join(test_dir, file_name)
+
+    def get_handle(self):
+        fetch_if_does_not_exist(self.file_name, self.path, self.source_url)
+        return open(self.path)
+
+    def get_path(self):
+        fetch_if_does_not_exist(self.file_name, self.path, self.source_url)
+        return self.path
+
+    def check_hash(self, hash):
+        return self.ref_hash == hash
+
+
+# Map containing test routines and files needed for them
+# Reference hashes generated with https://github.com/NickRoz1/BAM-file-hash-generator
+tests = {
+    # test_suites.test_match_mate_sort: [
+    #     (
+    #         "match_mates.bam",
+    #         "https://github.com/biod/sambamba/raw/master/test/match_mates.bam",
+    #         "390cdd7a23488217351161daa9f59736",
+    #     )
+    # ],
+    test_suites.test_parallel_bam_reader: [
+        (
+            "test_parallel_bam_reader.bam",
+            "http://hgdownload.cse.ucsc.edu/goldenPath/hg19/encodeDCC/wgEncodeUwRepliSeq/wgEncodeUwRepliSeqK562G1AlnRep1.bam",
+            "17c8bc5770e48dde225fd804c4bad013",
+        ),
+        (
+            "match_mates.bam",
+            "https://github.com/biod/sambamba/raw/master/test/match_mates.bam",
+            "390cdd7a23488217351161daa9f59736",
+        ),
+    ]
+}
+
 if __name__ == "__main__":
     cur_dir = pathlib.Path().resolve()
     test_dir = os.path.join(cur_dir, "test_files")
     if not os.path.exists(test_dir):
         os.mkdir(test_dir)
     binary_path = "target/release/bam_binary"
+    binary_wrapper = bam_parallel_binary(binary_path)
     for (test, required_files) in tests.items():
-        test_files_handles = []
-        for (file_name, file_url) in required_files:
-            file_path = os.path.join(test_dir, file_name)
-            print(file_path)
-            fetch_if_does_not_exist(file_path)
-            test_files_handles.append(open(file_path))
-        if not test(binary_path, test_files_handles):
+        test_files = []
+        for reqs in required_files:
+            test_files.append(test_tuple(test_dir, *reqs))
+        if not test(binary_wrapper, test_files):
             print("Test {} failed.".format(test.__name__))
         else:
             print("Test {} OK.".format(test.__name__))

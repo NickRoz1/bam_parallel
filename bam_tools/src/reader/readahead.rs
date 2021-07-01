@@ -2,9 +2,8 @@ use crate::block::Block;
 use crate::util::{fetch_block, inflate_data};
 
 // This module preparses GBAM blocks to parallelize decompression
-use super::util;
 use flume::{Receiver, Sender};
-use rayon::{spawn, ThreadPool};
+use rayon::spawn;
 use std::cmp::{Ord, Ordering, PartialEq, PartialOrd};
 use std::collections::BinaryHeap;
 use std::io::Read;

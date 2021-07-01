@@ -9,3 +9,6 @@ edition = "2018"
 [dependencies]
 structopt = "0.3.21"
 bam_tools = {path = "../bam_tools"}
+md-5 = "0.9.1"
+byteorder = "1.2.3"
+num_cpus = "0.2"
