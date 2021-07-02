@@ -2,11 +2,11 @@ mod block;
 pub mod gz;
 mod util;
 mod virtual_position;
-// pub mod sort {
-//     mod comparators;
-//     mod flags;
-//     pub mod sort;
-// }
+pub mod sort {
+    mod comparators;
+    mod flags;
+    pub mod sort;
+}
 mod reader;
 
 use block::Block;

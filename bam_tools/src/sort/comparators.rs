@@ -19,6 +19,7 @@ pub fn compare_read_names_and_mates(lhs: &BAMRawRecord, rhs: &BAMRawRecord) -> O
     if ordering == Ordering::Equal {
         let tag_lhs = get_tag_val(lhs);
         let tag_rhs = get_tag_val(rhs);
+
         if tag_lhs == tag_rhs {
             // Source https://github.com/biod/sambamba/blob/c795656721b3608ffe7765b6ab98502426d14131/BioD/bio/std/hts/bam/read.d#L1603
             let flag_lhs = get_flag_val(lhs);
@@ -37,9 +38,7 @@ fn get_flag_val(rec: &BAMRawRecord) -> u16 {
 }
 
 fn get_tag_val(rec: &BAMRawRecord) -> Option<i32> {
-    rec.get_tag(&[b'H', b'I']).map_or(None, |mut slice| {
-        Some(slice.read_i32::<LittleEndian>().unwrap())
-    })
+    rec.get_hit_count()
 }
 
 pub fn compare_coordinates_and_strand(lhs: &BAMRawRecord, rhs: &BAMRawRecord) -> Ordering {

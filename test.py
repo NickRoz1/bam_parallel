@@ -11,7 +11,7 @@ class bam_parallel_binary:
 
     def exec(self, command, quiet=True):
         if quiet:
-            command += "-q"
+            command += ["-q"]
         res = subprocess.run([self.binary_path] + command, capture_output=True)
         assert res.returncode == 0, res
         return res.stdout.strip().decode("utf-8")
@@ -62,7 +62,7 @@ tests = {
     #     (
     #         "match_mates.bam",
     #         "https://github.com/biod/sambamba/raw/master/test/match_mates.bam",
-    #         "390cdd7a23488217351161daa9f59736",
+    #         "dfc84d497d016ee477771ba35f56e1b6",
     #     )
     # ],
     test_suites.test_parallel_bam_reader: [
@@ -76,7 +76,7 @@ tests = {
             "https://github.com/biod/sambamba/raw/master/test/match_mates.bam",
             "390cdd7a23488217351161daa9f59736",
         ),
-    ]
+    ],
 }
 
 if __name__ == "__main__":

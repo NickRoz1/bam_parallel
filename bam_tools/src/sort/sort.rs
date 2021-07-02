@@ -5,15 +5,17 @@ use gbam_tools::BAMRawRecord;
 use lz4_flex;
 use rayon::prelude::ParallelSliceMut;
 use rayon::{self, ThreadPoolBuilder};
+use std::cmp::Reverse;
 
 use super::comparators::{
     compare_coordinates_and_strand, compare_read_names, compare_read_names_and_mates,
 };
 
+use gbam_tools::Fields;
 use std::cmp::{max, min, Ordering};
 use std::collections::BinaryHeap;
-use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::PathBuf;
 use tempdir::TempDir;
@@ -54,26 +56,26 @@ impl RecordsBuffer {
         self.records_bytes.clear();
     }
 
-    pub fn fill<R>(&mut self, reader: &mut Reader) {
+    pub fn fill(&mut self, reader: &mut Reader) -> std::io::Result<usize> {
         self.clear();
         let mut last_byte_offset: usize = 0;
         loop {
-            let block_size = reader.read_block_size().unwrap();
-            // We have to read at least something in the buffer, hence '> 0' check.
-            if last_byte_offset > 0 && last_byte_offset + block_size > self.mem_limit {
+            let rec_size = reader.append_record(&mut self.records_bytes)?;
+            if rec_size == 0 {
+                break;
+            }
+            // Push the range of bytes which this record occupies
+            self.records
+                .push(last_byte_offset..last_byte_offset + rec_size);
+            last_byte_offset += rec_size;
+            // println!("Buf size: {}", last_byte_offset);
+
+            if self.records_bytes.len() > self.mem_limit {
                 // Buffer has been filled.
                 break;
             }
-
-            self.records_bytes.resize(last_byte_offset + block_size, 0);
-            reader
-                .read_exact(&mut self.records_bytes[last_byte_offset..])
-                .unwrap();
-            // Push the range of bytes which this record occupies
-            self.records
-                .push(last_byte_offset..last_byte_offset + block_size);
-            last_byte_offset += block_size;
         }
+        Ok(last_byte_offset)
     }
 }
 
@@ -101,12 +103,16 @@ pub fn sort_bam<R: Read + Send + 'static, W: Write>(
     let reader_thread_num = max(min(num_cpus::get(), reader_thread_num), 1);
 
     let mut parallel_reader = Reader::new(reader, reader_thread_num);
+    parallel_reader.read_header().unwrap();
+    parallel_reader.consume_reference_sequences().unwrap();
+
+    let tmp_dir = TempDir::new_in(tmp_dir_path, "BAM sort temporary directory.").unwrap();
 
     let tmp_files = read_split_sort_dump_chunks(
         &mut parallel_reader,
         mem_limit,
         sort_thread_num,
-        tmp_dir_path,
+        &tmp_dir,
         compress_temp_files,
         sort_by,
     );
@@ -119,15 +125,12 @@ fn read_split_sort_dump_chunks(
     reader: &mut Reader,
     mem_limit: usize,
     sort_thread_num: usize,
-    tmp_dir_path: PathBuf,
+    tmp_dir: &TempDir,
     compress_temp_files: bool,
     sort_by: SortBy,
 ) -> Vec<File> {
     let (buf_send, buf_recv) = flume::unbounded();
     let mut recs_buf = Some(RecordsBuffer::new(mem_limit / 2));
-
-    buf_send.send(RecordsBuffer::new(mem_limit / 2)).unwrap();
-    let tmp_dir = TempDir::new_in(tmp_dir_path, "BAM sort temporary directory.").unwrap();
 
     let thread_pool = ThreadPoolBuilder::new()
         .num_threads(sort_thread_num)
@@ -138,20 +141,22 @@ fn read_split_sort_dump_chunks(
     let mut temp_files_counter = 0;
 
     // Load first chunk to start the cycle.
-    if !reader.empty() {
-        recs_buf.as_mut().unwrap().fill(reader);
-        let taken_buf = recs_buf.take().unwrap();
-        let send_channel = buf_send.clone();
-        thread_pool.spawn(move || sort_chunk(taken_buf, send_channel, sort_by));
-        // While one buffer is being sorted this one will be loaded with data.
-        recs_buf = Some(RecordsBuffer::new(mem_limit / 2));
-    } else {
+    if let Ok(0) = recs_buf.as_mut().unwrap().fill(reader) {
         // Empty file
         return Vec::new();
     }
-    while !reader.empty() {
-        recs_buf.as_mut().unwrap().clear();
-        recs_buf.as_mut().unwrap().fill(reader);
+
+    let taken_buf = recs_buf.take().unwrap();
+    let send_channel = buf_send.clone();
+    thread_pool.spawn(move || sort_chunk(taken_buf, send_channel, sort_by));
+    // While one buffer is being sorted this one will be loaded with data.
+    recs_buf = Some(RecordsBuffer::new(mem_limit / 2));
+
+    while let Ok(bytes_read) = recs_buf.as_mut().unwrap().fill(reader) {
+        if bytes_read == 0 {
+            break;
+        }
+
         let taken_buf = recs_buf.take().unwrap();
         let send_channel = buf_send.clone();
         thread_pool.spawn(move || sort_chunk(taken_buf, send_channel, sort_by));
@@ -174,14 +179,15 @@ fn read_split_sort_dump_chunks(
     // only one chunk in file) it's written straight to the resulting file, but
     // it's probably not worth it.
     let file_name = temp_files_counter.to_string();
-    let mut temp_file = make_tmp_file(&temp_files_counter.to_string(), &tmp_dir).unwrap();
+    let mut temp_file = make_tmp_file(&file_name, &tmp_dir).unwrap();
     dump(&last_buf, &mut temp_file, compress_temp_files).unwrap();
     temp_files.push(temp_file);
 
-    // Ensure all buffered data is written
-    temp_files
-        .iter_mut()
-        .for_each(|file| file.sync_all().unwrap());
+    // Ensure all buffered data is written and move cursors to the beginning of the files.
+    for temp_file in temp_files.iter_mut() {
+        temp_file.sync_all().unwrap();
+        temp_file.seek(SeekFrom::Start(0)).unwrap();
+    }
 
     return temp_files;
 }
@@ -201,6 +207,10 @@ fn dump(buf: &RecordsBuffer, file: &mut File, compress_temp_files: bool) -> std:
 fn write<W: Write>(buf: &RecordsBuffer, writer: &mut W) -> std::io::Result<()> {
     for rec in &buf.records {
         let rec_size = (rec.end - rec.start) as u64;
+        let next_rec = BAMRawRecord(std::borrow::Cow::Borrowed(
+            &buf.records_bytes[rec.start..rec.end],
+        ));
+        assert!(next_rec.l_read_name() < 99);
         writer.write_u64::<LittleEndian>(rec_size)?;
         writer.write_all(&buf.records_bytes[rec.start..rec.end])?;
     }
@@ -246,7 +256,12 @@ fn get_comparator(sort_by: SortBy) -> Comparator {
 
 fn make_tmp_file(file_name: &str, tmp_dir: &TempDir) -> std::io::Result<std::fs::File> {
     let file_path = tmp_dir.path().join(file_name);
-    File::create(file_path)
+
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(file_path)
 }
 
 // Struct which manages reading chunks from files
@@ -262,10 +277,9 @@ enum ChunkReaderStatus {
 impl ChunkReader {
     // Creates new ChunkReader for temp file.
     pub fn new(tmp_file: File, mem_limit: usize) -> Self {
-        let mut chunk_reader = Self {
+        Self {
             inner: BufReader::with_capacity(mem_limit, tmp_file),
-        };
-        chunk_reader
+        }
     }
     // Reads bytes from inner reader into inner buffer, discarding previous record.
     pub fn load_rec(&mut self, rec_buf: &mut Vec<u8>) -> std::io::Result<ChunkReaderStatus> {
@@ -278,6 +292,10 @@ impl ChunkReader {
         let data_len = (&len_buf[..]).read_u64::<LittleEndian>()?;
         rec_buf.resize(data_len as usize, 0);
         self.inner.read_exact(&mut rec_buf[..])?;
+        println!("Datalen: {}", data_len);
+        let next_rec = BAMRawRecord(std::borrow::Cow::Borrowed(&rec_buf));
+        println!("{}", next_rec.l_read_name());
+        next_rec.get_bytes(&Fields::ReadName);
         Ok(ChunkReaderStatus::LoadedRecord)
     }
 }
@@ -319,7 +337,7 @@ struct NWayMerger<'a> {
     // The ChunkReaders cache records and have peek() in their API, so it's
     // possible to choose what record should go first (they contain record
     // inside themselves).
-    min_heap: BinaryHeap<MergeCandidate<'a>>,
+    min_heap: BinaryHeap<Reverse<MergeCandidate<'a>>>,
 }
 
 impl<'a> NWayMerger<'a> {
@@ -330,11 +348,12 @@ impl<'a> NWayMerger<'a> {
         let mut provider_idx = 0;
         for mut chunk_reader in chunks_readers.into_iter() {
             let mut buf = Vec::<u8>::new();
+
             match chunk_reader.load_rec(&mut buf).unwrap() {
                 ChunkReaderStatus::ReachedEOF => panic!("Temporary file exists but it's empty."),
                 ChunkReaderStatus::LoadedRecord => {
                     let rec = BAMRawRecord(std::borrow::Cow::Owned(buf));
-                    min_heap.push(MergeCandidate(rec, provider_idx, comparator));
+                    min_heap.push(Reverse(MergeCandidate(rec, provider_idx, comparator)));
                     providers.push(chunk_reader);
                     provider_idx += 1;
                 }
@@ -354,8 +373,8 @@ impl<'a> NWayMerger<'a> {
         }
 
         let cur_rec = self.min_heap.pop().unwrap();
-        let rec_provider_idx = cur_rec.1;
-        let rec_comparator = cur_rec.2;
+        let rec_provider_idx = cur_rec.0 .1;
+        let rec_comparator = cur_rec.0 .2;
 
         // If ChunkReader reached EOF, don't put anything into min_heap so it
         // won't be touched anymore.
@@ -364,10 +383,14 @@ impl<'a> NWayMerger<'a> {
             .unwrap()
         {
             let next_rec = BAMRawRecord(std::borrow::Cow::Owned(used_buffer));
-            self.min_heap
-                .push(MergeCandidate(next_rec, rec_provider_idx, rec_comparator));
+
+            self.min_heap.push(Reverse(MergeCandidate(
+                next_rec,
+                rec_provider_idx,
+                rec_comparator,
+            )));
         }
-        Some(cur_rec.0)
+        Some(cur_rec.0 .0)
     }
 }
 
@@ -394,10 +417,13 @@ fn merge_sorted_chunks_and_write<W: Write>(
     let mut temp_buf = Vec::<u8>::new();
 
     while let Some(rec) = merger.get_next_rec(temp_buf) {
+        println!("Its fine for a while");
         writer.write_all(&rec.0[..])?;
         // Buffer rotation.
         temp_buf = rec.0.into_owned();
     }
+
+    writer.flush()?;
 
     Ok(())
 }

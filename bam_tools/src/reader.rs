@@ -16,6 +16,7 @@ use std::io::Read;
 pub struct Reader {
     readahead: Readahead,
     block_buffer: Option<Block>,
+    eof_reached: bool,
 }
 
 impl Reader {
@@ -25,6 +26,7 @@ impl Reader {
         Self {
             readahead,
             block_buffer: Some(Block::default()),
+            eof_reached: false,
         }
     }
 
@@ -86,13 +88,19 @@ impl Reader {
 
 impl Read for Reader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.eof_reached {
+            return Ok(0);
+        }
         match self.block_buffer.as_mut().unwrap().data_mut().read(buf) {
             // Block exhausted, get new.
             Ok(0) => {
                 // println!("Requested {} bytes", buf.len());
                 match self.readahead.get_block(self.block_buffer.take().unwrap()) {
                     // EOF
-                    None => Ok(0),
+                    None => {
+                        self.eof_reached = true;
+                        Ok(0)
+                    }
                     // New block has been read. Continue reading.
                     Some(new_block) => {
                         self.block_buffer = Some(new_block);
