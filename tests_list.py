@@ -1,7 +1,7 @@
 import test_suites
 
-# Map containing test routines and files needed for them
-# Reference hashes generated with https://github.com/NickRoz1/BAM-file-hash-generator
+# Map containing test routines and files needed for them.
+# Reference hashes generated with https://github.com/NickRoz1/BAM-file-hash-generator from files produced by sambamba-0.8.0
 tests = {
     test_suites.test_match_mate_sort: [
         (
