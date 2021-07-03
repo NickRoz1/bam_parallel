@@ -41,26 +41,26 @@ fn get_tag_val(rec: &BAMRawRecord) -> Option<i32> {
     rec.get_hit_count()
 }
 
-pub fn compare_coordinates_and_strand(lhs: &BAMRawRecord, rhs: &BAMRawRecord) -> Ordering {
-    let refid_lhs = get_ref_or_pos_id(lhs, &Fields::RefID);
-    let refid_rhs = get_ref_or_pos_id(rhs, &Fields::RefID);
-    if refid_lhs == -1 {
+pub fn compare_coordinates_and_strand(left: &BAMRawRecord, right: &BAMRawRecord) -> Ordering {
+    let refid_left = get_ref_or_pos_id(left, &Fields::RefID);
+    let refid_right = get_ref_or_pos_id(right, &Fields::RefID);
+    if refid_left == -1 {
         return Ordering::Greater;
     }
-    if refid_rhs == -1 {
+    if refid_right == -1 {
         return Ordering::Less;
     }
-    if refid_lhs != refid_lhs {
-        return refid_lhs.cmp(&refid_rhs);
+    if refid_left != refid_right {
+        return refid_left.cmp(&refid_right);
     }
-    let pos_lhs = get_ref_or_pos_id(lhs, &Fields::Pos);
-    let pos_rhs = get_ref_or_pos_id(rhs, &Fields::Pos);
-    if pos_lhs != pos_rhs {
-        return pos_lhs.cmp(&pos_rhs);
+    let pos_left = get_ref_or_pos_id(left, &Fields::Pos);
+    let pos_right = get_ref_or_pos_id(right, &Fields::Pos);
+    if pos_left != pos_right {
+        return pos_left.cmp(&pos_right);
     }
-    let is_reverse_strand_lhs = is_reverse_strand(lhs);
-    let is_reverse_strand_rhs = is_reverse_strand(rhs);
-    if !is_reverse_strand_lhs && is_reverse_strand_rhs {
+    let is_reverse_strand_left = is_reverse_strand(left);
+    let is_reverse_strand_right = is_reverse_strand(right);
+    if !is_reverse_strand_left && is_reverse_strand_right {
         return Ordering::Less;
     } else {
         return Ordering::Greater;

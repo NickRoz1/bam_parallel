@@ -1,6 +1,6 @@
 import os
 import pathlib
-import test_suites
+import tests_list
 import subprocess
 from urllib.request import urlretrieve
 
@@ -15,14 +15,6 @@ class bam_parallel_binary:
         res = subprocess.run([self.binary_path] + command, capture_output=True)
         assert res.returncode == 0, res
         return res.stdout.strip().decode("utf-8")
-
-
-# Generates md5 has sum via calling md5sum CLI
-# Test hash is generated using md5sum (GNU coreutils) 8.26
-def get_file_md5_sum(file_path):
-    res = subprocess.run(["md5sum", file_path], capture_output=True)
-    md5sum = res.split()[0]
-    return md5sum
 
 
 def fetch_if_does_not_exist(file_name, file_path, file_url):
@@ -55,30 +47,6 @@ class test_tuple:
         return self.ref_hash == hash
 
 
-# Map containing test routines and files needed for them
-# Reference hashes generated with https://github.com/NickRoz1/BAM-file-hash-generator
-tests = {
-    # test_suites.test_match_mate_sort: [
-    #     (
-    #         "match_mates.bam",
-    #         "https://github.com/biod/sambamba/raw/master/test/match_mates.bam",
-    #         "dfc84d497d016ee477771ba35f56e1b6",
-    #     )
-    # ],
-    test_suites.test_parallel_bam_reader: [
-        (
-            "test_parallel_bam_reader.bam",
-            "http://hgdownload.cse.ucsc.edu/goldenPath/hg19/encodeDCC/wgEncodeUwRepliSeq/wgEncodeUwRepliSeqK562G1AlnRep1.bam",
-            "17c8bc5770e48dde225fd804c4bad013",
-        ),
-        (
-            "match_mates.bam",
-            "https://github.com/biod/sambamba/raw/master/test/match_mates.bam",
-            "390cdd7a23488217351161daa9f59736",
-        ),
-    ],
-}
-
 if __name__ == "__main__":
     cur_dir = pathlib.Path().resolve()
     test_dir = os.path.join(cur_dir, "test_files")
@@ -86,7 +54,7 @@ if __name__ == "__main__":
         os.mkdir(test_dir)
     binary_path = "target/release/bam_binary"
     binary_wrapper = bam_parallel_binary(binary_path)
-    for (test, required_files) in tests.items():
+    for (test, required_files) in tests_list.tests.items():
         test_files = []
         for reqs in required_files:
             test_files.append(test_tuple(test_dir, *reqs))

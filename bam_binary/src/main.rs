@@ -64,7 +64,7 @@ fn main() {
     let tmp_dir_path = env::temp_dir();
 
     sort_bam(
-        10 * MEGA_BYTE_SIZE,
+        2000 * MEGA_BYTE_SIZE,
         reader,
         &mut writer,
         tmp_dir_path,

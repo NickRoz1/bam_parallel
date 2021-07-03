@@ -11,7 +11,6 @@ use super::comparators::{
     compare_coordinates_and_strand, compare_read_names, compare_read_names_and_mates,
 };
 
-use gbam_tools::Fields;
 use std::cmp::{max, min, Ordering};
 use std::collections::BinaryHeap;
 use std::fs::{File, OpenOptions};
@@ -207,10 +206,6 @@ fn dump(buf: &RecordsBuffer, file: &mut File, compress_temp_files: bool) -> std:
 fn write<W: Write>(buf: &RecordsBuffer, writer: &mut W) -> std::io::Result<()> {
     for rec in &buf.records {
         let rec_size = (rec.end - rec.start) as u64;
-        let next_rec = BAMRawRecord(std::borrow::Cow::Borrowed(
-            &buf.records_bytes[rec.start..rec.end],
-        ));
-        assert!(next_rec.l_read_name() < 99);
         writer.write_u64::<LittleEndian>(rec_size)?;
         writer.write_all(&buf.records_bytes[rec.start..rec.end])?;
     }
@@ -258,9 +253,9 @@ fn make_tmp_file(file_name: &str, tmp_dir: &TempDir) -> std::io::Result<std::fs:
     let file_path = tmp_dir.path().join(file_name);
 
     OpenOptions::new()
+        .create(true)
         .read(true)
         .write(true)
-        .create(true)
         .open(file_path)
 }
 
@@ -285,17 +280,17 @@ impl ChunkReader {
     pub fn load_rec(&mut self, rec_buf: &mut Vec<u8>) -> std::io::Result<ChunkReaderStatus> {
         // Needed to check whether EOF is reached.
         let mut len_buf: [u8; 8] = [0; 8];
-        if self.inner.read(&mut len_buf[..])? == 0 {
+        match self.inner.read_exact(&mut len_buf[..]) {
             // EOF reached.
-            return Ok(ChunkReaderStatus::ReachedEOF);
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(ChunkReaderStatus::ReachedEOF)
+            }
+            Ok(()) => (),
+            Err(e) => Err(e)?,
         }
         let data_len = (&len_buf[..]).read_u64::<LittleEndian>()?;
         rec_buf.resize(data_len as usize, 0);
         self.inner.read_exact(&mut rec_buf[..])?;
-        println!("Datalen: {}", data_len);
-        let next_rec = BAMRawRecord(std::borrow::Cow::Borrowed(&rec_buf));
-        println!("{}", next_rec.l_read_name());
-        next_rec.get_bytes(&Fields::ReadName);
         Ok(ChunkReaderStatus::LoadedRecord)
     }
 }
@@ -405,7 +400,6 @@ fn merge_sorted_chunks_and_write<W: Write>(
     let num_chunks = tmp_files.len();
     let input_buf_mem_limit = min(16 * MEGA_BYTE_SIZE, mem_limit / 4 / num_chunks);
 
-    // ChunkReader
     let chunks_readers: Vec<ChunkReader> = tmp_files
         .into_iter()
         .map(|tmp_file| ChunkReader::new(tmp_file, input_buf_mem_limit))
@@ -417,7 +411,6 @@ fn merge_sorted_chunks_and_write<W: Write>(
     let mut temp_buf = Vec::<u8>::new();
 
     while let Some(rec) = merger.get_next_rec(temp_buf) {
-        println!("Its fine for a while");
         writer.write_all(&rec.0[..])?;
         // Buffer rotation.
         temp_buf = rec.0.into_owned();
