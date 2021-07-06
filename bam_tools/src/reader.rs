@@ -1,7 +1,6 @@
 mod readahead;
 mod records;
 
-use crate::block;
 use crate::block::Block;
 use crate::MAGIC_NUMBER;
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -164,8 +163,8 @@ where
     let mut c_name = vec![0; l_name];
     reader.read_exact(&mut c_name)?;
 
-    let name = bytes_with_nul_to_string(&c_name)?;
-    let l_ref = reader.read_u32::<LittleEndian>().and_then(|len| {
+    let _name = bytes_with_nul_to_string(&c_name)?;
+    let _l_ref = reader.read_u32::<LittleEndian>().and_then(|len| {
         i32::try_from(len).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     })?;
 

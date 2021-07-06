@@ -1,6 +1,6 @@
 // Source: https://github.com/zaeleus/noodles/blob/master/noodles-bam/src/reader/records.rs
 
-use std::io::{self, Read};
+use std::io::{self};
 
 use super::Reader;
 

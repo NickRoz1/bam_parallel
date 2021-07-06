@@ -4,9 +4,6 @@ use std::{convert::TryFrom, io::Cursor};
 
 use super::{virtual_position, VirtualPosition};
 
-/// The max size in bytes of a BGZF block.
-pub const MAX_LENGTH: usize = u16::MAX as usize; // bytes
-
 /// A BGZF block.
 ///
 /// A BGZF block is a gzip stream less than 64 KiB and contains an extra field describing the size
@@ -18,6 +15,7 @@ pub(crate) struct Block {
     data: Cursor<Vec<u8>>,
 }
 
+#[allow(dead_code)]
 impl Block {
     /// Sets the position of this block in the compressed stream.
     pub fn set_position(&mut self, pos: u64) {

@@ -41,7 +41,7 @@ pub(crate) fn fetch_block(
     cdata.resize(cdata_len, Default::default());
     reader.read_exact(cdata)?;
 
-    let ulen = read_trailer(reader)?;
+    consume_trailer(reader)?;
 
     block.set_len(block_size as u64);
 
@@ -65,7 +65,7 @@ fn read_block_size(reader: &mut dyn Read) -> io::Result<u16> {
     Ok(LittleEndian::read_u16(bsize) + 1)
 }
 
-fn read_trailer(reader: &mut dyn Read) -> io::Result<()> {
+fn consume_trailer(reader: &mut dyn Read) -> io::Result<()> {
     let mut trailer = [0; TRAILER_SIZE];
     reader.read_exact(&mut trailer)
 }

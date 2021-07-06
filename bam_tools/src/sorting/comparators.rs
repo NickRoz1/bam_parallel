@@ -1,14 +1,14 @@
 use super::flags;
+use crate::record::bamrawrecord::BAMRawRecord;
+use crate::record::fields::Fields;
 use byteorder::{LittleEndian, ReadBytesExt};
-use gbam_tools::BAMRawRecord;
-use gbam_tools::Fields;
 use std::cmp::Ordering;
 use std::str::from_utf8;
 
 pub fn compare_read_names(lhs: &BAMRawRecord, rhs: &BAMRawRecord) -> Ordering {
     let name_lhs = from_utf8(lhs.get_bytes(&Fields::ReadName)).unwrap();
     let name_rhs = from_utf8(rhs.get_bytes(&Fields::ReadName)).unwrap();
-    return name_lhs.cmp(name_rhs);
+    name_lhs.cmp(name_rhs)
 }
 
 /// Comparison function for 'queryname' sorting order setting mates
@@ -28,7 +28,7 @@ pub fn compare_read_names_and_mates(lhs: &BAMRawRecord, rhs: &BAMRawRecord) -> O
         }
         return tag_lhs.unwrap().cmp(&tag_rhs.unwrap());
     }
-    return ordering;
+    ordering
 }
 
 fn get_flag_val(rec: &BAMRawRecord) -> u16 {
@@ -61,9 +61,9 @@ pub fn compare_coordinates_and_strand(left: &BAMRawRecord, right: &BAMRawRecord)
     let is_reverse_strand_left = is_reverse_strand(left);
     let is_reverse_strand_right = is_reverse_strand(right);
     if !is_reverse_strand_left && is_reverse_strand_right {
-        return Ordering::Less;
+        Ordering::Less
     } else {
-        return Ordering::Greater;
+        Ordering::Greater
     }
 }
 

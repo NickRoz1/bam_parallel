@@ -1,11 +1,10 @@
-use bam_tools::sort::sort::sort_bam;
-use bam_tools::sort::sort::SortBy;
+use bam_tools::sorting::sort::sort_bam;
+use bam_tools::sorting::sort::SortBy;
 use bam_tools::Reader;
 use bam_tools::MEGA_BYTE_SIZE;
 use md5::{Digest, Md5};
 use std::env;
 
-use byteorder::{LittleEndian, ReadBytesExt};
 use std::fs::File;
 use std::io::BufReader;
 use std::io::BufWriter;

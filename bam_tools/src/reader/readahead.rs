@@ -10,6 +10,7 @@ use std::io::Read;
 
 enum Status {
     Success(Block),
+    #[allow(clippy::clippy::upper_case_acronyms)]
     EOF,
 }
 
@@ -98,7 +99,7 @@ impl Readahead {
                 let read_buf_sender = read_bufs_send.clone();
 
                 spawn(move || {
-                    decompress_block(&mut read_buf, &mut block);
+                    decompress_block(&read_buf, &mut block);
                     task_ready_to_sort_tx
                         .send(Task(cur_task, Status::Success(block)))
                         .unwrap();
@@ -133,6 +134,6 @@ impl Readahead {
 fn decompress_block(read_buf: &[u8], block: &mut Block) {
     let udata = block.data_mut();
     let udata_buf = udata.get_mut();
-    inflate_data(&read_buf[..], udata_buf).expect("Decompression failed.");
+    inflate_data(read_buf, udata_buf).expect("Decompression failed.");
     udata.set_position(0);
 }

@@ -1,7 +1,7 @@
+use crate::record::bamrawrecord::BAMRawRecord;
 use crate::{Reader, MEGA_BYTE_SIZE};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use flume::Sender;
-use gbam_tools::BAMRawRecord;
 use lz4_flex;
 use rayon::prelude::ParallelSliceMut;
 use rayon::{self, ThreadPoolBuilder};
@@ -188,7 +188,7 @@ fn read_split_sort_dump_chunks(
         temp_file.seek(SeekFrom::Start(0)).unwrap();
     }
 
-    return temp_files;
+    temp_files
 }
 
 fn dump(buf: &RecordsBuffer, file: &mut File, compress_temp_files: bool) -> std::io::Result<()> {
@@ -227,7 +227,7 @@ fn sort_chunk(mut buf: RecordsBuffer, buf_return: Sender<RecordsBuffer>, sort_by
             )
         })
         .collect();
-    &record_wrappers[..].par_sort_by(get_tuple_comparator(sort_by));
+    record_wrappers[..].par_sort_by(get_tuple_comparator(sort_by));
     // The BAMRawRecords and their corresponding ranges are now in
     // order. Replace original ranges with the sorted ones.
     buf.records = record_wrappers.into_iter().map(|rec| rec.1).collect();
@@ -286,7 +286,7 @@ impl ChunkReader {
                 return Ok(ChunkReaderStatus::ReachedEOF)
             }
             Ok(()) => (),
-            Err(e) => Err(e)?,
+            Err(e) => return Err(e),
         }
         let data_len = (&len_buf[..]).read_u64::<LittleEndian>()?;
         rec_buf.resize(data_len as usize, 0);
@@ -305,10 +305,7 @@ struct MergeCandidate<'a>(BAMRawRecord<'a>, usize, &'a Comparator);
 
 impl<'a> PartialEq for MergeCandidate<'a> {
     fn eq(&self, other: &Self) -> bool {
-        match (self.2)(&self.0, &other.0) {
-            Ordering::Equal => true,
-            _ => false,
-        }
+        matches!((self.2)(&self.0, &other.0), Ordering::Equal)
     }
 }
 
@@ -371,8 +368,8 @@ impl<'a> NWayMerger<'a> {
         let rec_provider_idx = cur_rec.0 .1;
         let rec_comparator = cur_rec.0 .2;
 
-        // If ChunkReader reached EOF, don't put anything into min_heap so it
-        // won't be touched anymore.
+        // If ChunkReader reached EOF, don't put anything into min_heap so empty
+        // ChunkReader won't be touched anymore.
         if let ChunkReaderStatus::LoadedRecord = self.providers[rec_provider_idx]
             .load_rec(&mut used_buffer)
             .unwrap()
