@@ -19,8 +19,10 @@ pub struct Reader {
 }
 
 impl Reader {
-    pub fn new<RSS: Read + Send + 'static>(inner: RSS, thread_num: usize) -> Self {
-        assert!(thread_num > 0 && thread_num <= num_cpus::get());
+    pub fn new<RSS: Read + Send + 'static>(inner: RSS, mut thread_num: usize) -> Self {
+        if thread_num > num_cpus::get() {
+            thread_num = num_cpus::get();
+        }
         let readahead = Readahead::new(thread_num, Box::new(inner));
         Self {
             readahead,
