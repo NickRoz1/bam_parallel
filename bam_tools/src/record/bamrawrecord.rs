@@ -103,6 +103,14 @@ impl<'a> BAMRawRecord<'a> {
         }
     }
 
+    // Calculates range of bytes containing specified field.
+    pub fn get_range(&self, field: &Fields) -> std::ops::Range<usize> {
+        match field {
+            Fields::ReadName => 32..(32 + self.get_var_field_len(field)),
+            _ => panic!("This field is not supported: {} \n", *field as usize),
+        }
+    }
+
     /// Extracts CIGAR from tags if it didn't fit into CIGAR field
     fn get_cigar(&self, cigar_offset: usize) -> &[u8] {
         let ref_id = self

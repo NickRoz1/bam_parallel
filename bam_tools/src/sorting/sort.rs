@@ -5,10 +5,13 @@ use flume::Sender;
 use lz4_flex;
 use rayon::prelude::ParallelSliceMut;
 use rayon::{self, ThreadPoolBuilder};
+use std::borrow::{Borrow, Cow};
 use std::cmp::Reverse;
+use std::slice::from_raw_parts;
 
 use super::comparators::{
-    compare_coordinates_and_strand, compare_read_names, compare_read_names_and_mates,
+    compare_coordinates_and_strand, compare_read_names, compare_read_names_and_mates, extract_key,
+    KeyTuple,
 };
 
 use std::cmp::{max, min, Ordering};
@@ -17,7 +20,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use tempdir::TempDir;
+
+static mut io_wait: Duration = Duration::from_secs(0);
 
 /// This struct manages buffer for unsorted reads
 // #[derive(Send)]
@@ -56,6 +62,7 @@ impl RecordsBuffer {
     }
 
     pub fn fill(&mut self, reader: &mut Reader) -> std::io::Result<usize> {
+        let now = Instant::now();
         self.clear();
         let mut last_byte_offset: usize = 0;
         loop {
@@ -73,6 +80,9 @@ impl RecordsBuffer {
                 // Buffer has been filled.
                 break;
             }
+        }
+        unsafe {
+            io_wait += now.elapsed();
         }
         Ok(last_byte_offset)
     }
@@ -107,6 +117,7 @@ pub fn sort_bam<R: Read + Send + 'static, W: Write>(
 
     let tmp_dir = TempDir::new_in(tmp_dir_path, "BAM sort temporary directory.").unwrap();
 
+    let now = Instant::now();
     let tmp_files = read_split_sort_dump_chunks(
         &mut parallel_reader,
         mem_limit,
@@ -117,6 +128,12 @@ pub fn sort_bam<R: Read + Send + 'static, W: Write>(
     );
 
     merge_sorted_chunks_and_write(mem_limit, tmp_files, sort_by, sorted_sink)?;
+    unsafe {
+        println!(
+            "Elapsed time without IO in Rust sort: {:?}",
+            now.elapsed() - io_wait
+        );
+    }
     Ok(())
 }
 
@@ -192,6 +209,7 @@ fn read_split_sort_dump_chunks(
 }
 
 fn dump(buf: &RecordsBuffer, file: &mut File, compress_temp_files: bool) -> std::io::Result<()> {
+    let now = Instant::now();
     let mut buf_writer = BufWriter::new(file);
     if compress_temp_files {
         let mut wrt = lz4_flex::frame::FrameEncoder::new(buf_writer);
@@ -199,6 +217,9 @@ fn dump(buf: &RecordsBuffer, file: &mut File, compress_temp_files: bool) -> std:
         wrt.finish().unwrap();
     } else {
         write(buf, &mut buf_writer)?;
+    }
+    unsafe {
+        io_wait += now.elapsed();
     }
     Ok(())
 }
@@ -215,28 +236,30 @@ fn write<W: Write>(buf: &RecordsBuffer, writer: &mut W) -> std::io::Result<()> {
 // For each byte range construct record wrapper, sort records and then reorder
 // the ranges to write byte ranges into file in sorted order.
 fn sort_chunk(mut buf: RecordsBuffer, buf_return: Sender<RecordsBuffer>, sort_by: SortBy) {
-    let mut record_wrappers: Vec<(BAMRawRecord, Range<usize>)> = buf
-        .records
-        .iter()
-        .map(|range| {
-            (
-                BAMRawRecord(std::borrow::Cow::Borrowed(
-                    &buf.records_bytes[range.start..range.end],
-                )),
-                range.clone(),
-            )
-        })
-        .collect();
-    record_wrappers[..].par_sort_by(get_tuple_comparator(sort_by));
+    let mut sorting_keys: Vec<(KeyTuple, Range<usize>)> = Vec::new();
+    for range in buf.records {
+        let rec_wrapper = BAMRawRecord(std::borrow::Cow::Borrowed(
+            &buf.records_bytes[range.start..range.end],
+        ));
+        sorting_keys.push((
+            extract_key(
+                &rec_wrapper,
+                &buf.records_bytes[range.start..range.end],
+                &sort_by,
+            ),
+            range,
+        ));
+    }
+    sorting_keys[..].par_sort_by(get_tuple_comparator(sort_by));
     // The BAMRawRecords and their corresponding ranges are now in
     // order. Replace original ranges with the sorted ones.
-    buf.records = record_wrappers.into_iter().map(|rec| rec.1).collect();
+    buf.records = sorting_keys.into_iter().map(|rec| rec.1).collect();
     buf_return.send(buf).unwrap();
 }
 
 fn get_tuple_comparator(
     sort_by: SortBy,
-) -> impl Fn(&(BAMRawRecord, Range<usize>), &(BAMRawRecord, Range<usize>)) -> Ordering {
+) -> impl Fn(&(KeyTuple, Range<usize>), &(KeyTuple, Range<usize>)) -> Ordering {
     let cmp = get_comparator(sort_by);
     move |a, b| cmp(&a.0, &b.0)
 }
@@ -276,7 +299,7 @@ impl ChunkReader {
             inner: BufReader::with_capacity(mem_limit, tmp_file),
         }
     }
-    // Reads bytes from inner reader into inner buffer, discarding previous record.
+    // Reads bytes from inner reader into buffer.
     pub fn load_rec(&mut self, rec_buf: &mut Vec<u8>) -> std::io::Result<ChunkReaderStatus> {
         // Needed to check whether EOF is reached.
         let mut len_buf: [u8; 8] = [0; 8];
@@ -295,17 +318,54 @@ impl ChunkReader {
     }
 }
 
-type Comparator = fn(&BAMRawRecord, &BAMRawRecord) -> Ordering;
+type Comparator = fn(&KeyTuple, &KeyTuple) -> Ordering;
 
 // Comparator field is used to order records in BinaryHeap. One can create
 // wrapper structs and define Ord and PartialOrd traits for them, and then just
 // pass generic parameters to BinaryHeap instead of this. But this solution is
 // simpler.
-struct MergeCandidate<'a>(BAMRawRecord<'a>, usize, &'a Comparator);
+struct MergeCandidate<'a> {
+    key: KeyTuple<'a>,
+    buf: Vec<u8>,
+    provider_idx: usize,
+    comparator: &'a Comparator,
+}
+
+impl<'a> MergeCandidate<'a> {
+    pub fn new(
+        buf: Vec<u8>,
+        provider_idx: usize,
+        comparator: &'a Comparator,
+        sort_by: &SortBy,
+    ) -> Self {
+        let ptr = buf.as_ptr();
+        let rec_bytes = unsafe { from_raw_parts(ptr, buf.len()) };
+        let rec = BAMRawRecord(Cow::Borrowed(&rec_bytes[..]));
+        let key = extract_key(&rec, &rec_bytes[..], sort_by);
+
+        Self {
+            key,
+            buf,
+            provider_idx,
+            comparator,
+        }
+    }
+
+    pub fn get_key(&self) -> &KeyTuple {
+        &self.key
+    }
+
+    pub fn get_data(self) -> Vec<u8> {
+        self.buf
+    }
+}
 
 impl<'a> PartialEq for MergeCandidate<'a> {
     fn eq(&self, other: &Self) -> bool {
-        matches!((self.2)(&self.0, &other.0), Ordering::Equal)
+        matches!(
+            (self.comparator)(&self.get_key(), &other.get_key()),
+            Ordering::Equal
+        )
     }
 }
 
@@ -314,12 +374,12 @@ impl<'a> Eq for MergeCandidate<'a> {}
 // WARNING: the assumption is made that A < B and B < C means A < C
 impl<'a> PartialOrd for MergeCandidate<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some((self.2)(&self.0, &other.0))
+        Some((self.comparator)(&self.get_key(), &other.get_key()))
     }
 }
 impl<'a> Ord for MergeCandidate<'a> {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.2)(&self.0, &other.0)
+        (self.comparator)(&self.get_key(), &other.get_key())
     }
 }
 
@@ -330,10 +390,15 @@ struct NWayMerger<'a> {
     // possible to choose what record should go first (they contain record
     // inside themselves).
     min_heap: BinaryHeap<Reverse<MergeCandidate<'a>>>,
+    sort_by: SortBy,
 }
 
 impl<'a> NWayMerger<'a> {
-    pub fn new(chunks_readers: Vec<ChunkReader>, comparator: &'a Comparator) -> Self {
+    pub fn new(
+        chunks_readers: Vec<ChunkReader>,
+        comparator: &'a Comparator,
+        sort_by: SortBy,
+    ) -> Self {
         let mut min_heap = BinaryHeap::new();
         let mut providers = Vec::<ChunkReader>::new();
 
@@ -344,8 +409,12 @@ impl<'a> NWayMerger<'a> {
             match chunk_reader.load_rec(&mut buf).unwrap() {
                 ChunkReaderStatus::ReachedEOF => panic!("Temporary file exists but it's empty."),
                 ChunkReaderStatus::LoadedRecord => {
-                    let rec = BAMRawRecord(std::borrow::Cow::Owned(buf));
-                    min_heap.push(Reverse(MergeCandidate(rec, provider_idx, comparator)));
+                    min_heap.push(Reverse(MergeCandidate::new(
+                        buf,
+                        provider_idx,
+                        comparator,
+                        &sort_by,
+                    )));
                     providers.push(chunk_reader);
                     provider_idx += 1;
                 }
@@ -355,6 +424,7 @@ impl<'a> NWayMerger<'a> {
         Self {
             providers,
             min_heap,
+            sort_by,
         }
     }
 
@@ -364,25 +434,28 @@ impl<'a> NWayMerger<'a> {
             return None;
         }
 
-        let cur_rec = self.min_heap.pop().unwrap();
-        let rec_provider_idx = cur_rec.0 .1;
-        let rec_comparator = cur_rec.0 .2;
+        let cur_rec = self.min_heap.pop().unwrap().0;
+        let rec_provider_idx = cur_rec.provider_idx;
+        let rec_comparator = cur_rec.comparator;
 
+        let now = Instant::now();
         // If ChunkReader reached EOF, don't put anything into min_heap so empty
         // ChunkReader won't be touched anymore.
         if let ChunkReaderStatus::LoadedRecord = self.providers[rec_provider_idx]
             .load_rec(&mut used_buffer)
             .unwrap()
         {
-            let next_rec = BAMRawRecord(std::borrow::Cow::Owned(used_buffer));
-
-            self.min_heap.push(Reverse(MergeCandidate(
-                next_rec,
+            unsafe {
+                io_wait += now.elapsed();
+            }
+            self.min_heap.push(Reverse(MergeCandidate::new(
+                used_buffer,
                 rec_provider_idx,
                 rec_comparator,
+                &self.sort_by,
             )));
         }
-        Some(cur_rec.0 .0)
+        Some(BAMRawRecord(Cow::Owned(cur_rec.get_data())))
     }
 }
 
@@ -397,18 +470,28 @@ fn merge_sorted_chunks_and_write<W: Write>(
     let num_chunks = tmp_files.len();
     let input_buf_mem_limit = min(16 * MEGA_BYTE_SIZE, mem_limit / 4 / num_chunks);
 
+    let now = Instant::now();
     let chunks_readers: Vec<ChunkReader> = tmp_files
         .into_iter()
         .map(|tmp_file| ChunkReader::new(tmp_file, input_buf_mem_limit))
         .collect();
 
     let comparator = get_comparator(sort_by);
-    let mut merger = NWayMerger::new(chunks_readers, &comparator);
+    let mut merger = NWayMerger::new(chunks_readers, &comparator, sort_by);
 
     let mut temp_buf = Vec::<u8>::new();
 
+    unsafe {
+        io_wait += now.elapsed();
+    }
+    let mut prev;
+
     while let Some(rec) = merger.get_next_rec(temp_buf) {
+        prev = now.elapsed();
         writer.write_all(&rec.0[..])?;
+        unsafe {
+            io_wait += now.elapsed() - prev;
+        }
         // Buffer rotation.
         temp_buf = rec.0.into_owned();
     }
