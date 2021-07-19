@@ -122,7 +122,10 @@ impl Readahead {
     /// blocked until uncompressed buffer appears.
     pub fn get_block(&mut self, old_buf: Block) -> Option<Block> {
         if !self.used_block_sender.is_disconnected() {
-            self.used_block_sender.send(old_buf).unwrap();
+            // Ignore even if it errs. Even though the check has been passed at
+            // this point the threads might have been already terminated, so it
+            // will err on send attempt (no available receivers).
+            let _ = self.used_block_sender.send(old_buf);
         }
         match self.ready_to_processing_rx.recv().unwrap() {
             Status::Success(block) => Some(block),
