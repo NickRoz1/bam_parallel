@@ -6,6 +6,7 @@ use std::borrow::Cow;
 use std::ops::{Deref, DerefMut};
 
 use super::tags::get_hit_count;
+
 /// Provides convenient access to BAM-style raw read (record bytes)
 /// Cow is used so BAMRawRecord can either own or borrow underlying data (if it won't be mutated).
 #[derive(Clone, Eq, PartialEq, Debug)]

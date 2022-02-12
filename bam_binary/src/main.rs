@@ -84,7 +84,7 @@ fn generate_file_hash<R: Read + Send + 'static>(reader: R) -> String {
     let mut hasher = Md5::new();
 
     bgzf_reader.read_header().unwrap();
-    bgzf_reader.consume_reference_sequences().unwrap();
+    bgzf_reader.parse_reference_sequences().unwrap();
 
     let mut records = bgzf_reader.records();
     while let Some(Ok(rec)) = records.next_rec() {

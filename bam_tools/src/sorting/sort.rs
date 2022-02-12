@@ -113,7 +113,7 @@ pub fn sort_bam<R: Read + Send + 'static, W: Write>(
 
     let mut parallel_reader = Reader::new(reader, reader_thread_num);
     parallel_reader.read_header().unwrap();
-    parallel_reader.consume_reference_sequences().unwrap();
+    parallel_reader.parse_reference_sequences().unwrap();
 
     let tmp_dir = TempDir::new_in(tmp_dir_path, "BAM sort temporary directory.").unwrap();
 

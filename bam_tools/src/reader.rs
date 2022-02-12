@@ -74,16 +74,17 @@ impl Reader {
         read_header(self)
     }
 
-    pub fn consume_reference_sequences(&mut self) -> io::Result<()> {
+    pub fn parse_reference_sequences(&mut self) -> io::Result<Vec<(String, i32)>> {
         let n_ref = self.read_u32::<LittleEndian>().and_then(|n| {
             usize::try_from(n).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         })?;
 
+        let mut vec = Vec::new();
         for _ in 0..n_ref {
-            consume_reference_sequence(self)?;
+            vec.push(parse_reference_sequence(self)?);
         }
 
-        Ok(())
+        Ok(vec)
     }
 }
 
@@ -154,7 +155,7 @@ fn bytes_with_nul_to_string(buf: &[u8]) -> io::Result<String> {
         })
 }
 
-fn consume_reference_sequence<R>(reader: &mut R) -> io::Result<()>
+fn parse_reference_sequence<R>(reader: &mut R) -> io::Result<(String, i32)>
 where
     R: Read,
 {
@@ -170,5 +171,5 @@ where
         i32::try_from(len).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     })?;
 
-    Ok(())
+    Ok((_name, _l_ref))
 }

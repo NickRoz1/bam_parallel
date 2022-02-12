@@ -1,7 +1,7 @@
 use crate::block::Block;
 use crate::util::{fetch_block, inflate_data};
 
-// This module preparses GBAM blocks to parallelize decompression
+// This module preparses BAM blocks to parallelize decompression
 use flume::{Receiver, Sender};
 use rayon::spawn;
 use std::cmp::{Ord, Ordering, PartialEq, PartialOrd};
@@ -53,7 +53,7 @@ impl Readahead {
         let (used_block_sender, used_block_receiver) = flume::unbounded();
         let (completed_task_tx, sorting_blocks_rx) = flume::unbounded();
         let (ready_tasks_tx, ready_to_processing_rx) = flume::unbounded();
-
+        eprintln!("{:?}", thread_num);
         for _ in 0..thread_num {
             read_bufs_send.send(Vec::new()).unwrap();
             used_block_sender.send(Block::default()).unwrap();
@@ -121,16 +121,20 @@ impl Readahead {
     /// no uncompressed blocks in queue, the thread which called it will be
     /// blocked until uncompressed buffer appears.
     pub fn get_block(&mut self, old_buf: Block) -> Option<Block> {
+        // eprintln!("3.6.");
         if !self.used_block_sender.is_disconnected() {
             // Ignore even if it errs. Even though the check has been passed at
             // this point the threads might have been already terminated, so it
             // will err on send attempt (no available receivers).
             let _ = self.used_block_sender.send(old_buf);
         }
-        match self.ready_to_processing_rx.recv().unwrap() {
+        // eprintln!("3.7.");
+        let temp = match self.ready_to_processing_rx.recv().unwrap() {
             Status::Success(block) => Some(block),
             Status::EOF => None,
-        }
+        };
+        // eprintln!("3.8.");
+        temp
     }
 }
 
