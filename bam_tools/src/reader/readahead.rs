@@ -48,18 +48,19 @@ pub(crate) struct Readahead {
 }
 
 impl Readahead {
-    pub fn new(thread_num: usize, mut reader: Box<dyn Read + Send + 'static>) -> Self {
+    pub fn new(mut thread_num: usize, mut reader: Box<dyn Read + Send + 'static>) -> Self {
+        // No less than 3 threads to avoid deadlock.
+        thread_num = std::cmp::max(thread_num, 3);
         let (read_bufs_send, read_bufs_recv) = flume::unbounded();
         let (used_block_sender, used_block_receiver) = flume::unbounded();
         let (completed_task_tx, sorting_blocks_rx) = flume::unbounded();
         let (ready_tasks_tx, ready_to_processing_rx) = flume::unbounded();
-        eprintln!("{:?}", thread_num);
         for _ in 0..thread_num {
             read_bufs_send.send(Vec::new()).unwrap();
             used_block_sender.send(Block::default()).unwrap();
         }
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(std::cmp::max(thread_num, 3)) // No less than 3 threads to avoid deadlock.
+            .num_threads(thread_num)
             .build()
             .unwrap();
 
@@ -73,7 +74,10 @@ impl Readahead {
             while let Ok(work_unit) = sorting_blocks_rx.recv() {
                 block_heap.push(work_unit);
                 // Fill queue with parsed blocks.
-                while !block_heap.is_empty() && (block_heap.peek().unwrap().0 == cur_block_num) {
+                while !block_heap.is_empty()
+                    && (block_heap.peek().unwrap().0 == cur_block_num)
+                    && !ready_tasks_tx.is_disconnected()
+                {
                     ready_tasks_tx.send((block_heap.pop().unwrap()).1).unwrap();
                     // The block is extracted. Wait for next one.
                     cur_block_num += 1;
