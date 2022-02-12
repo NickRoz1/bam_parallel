@@ -59,7 +59,7 @@ impl Readahead {
             used_block_sender.send(Block::default()).unwrap();
         }
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(thread_num)
+            .num_threads(std::cmp::max(thread_num, 3)) // No less than 3 threads to avoid deadlock.
             .build()
             .unwrap();
 
