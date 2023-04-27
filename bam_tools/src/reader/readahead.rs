@@ -8,9 +8,9 @@ use std::cmp::{Ord, Ordering, PartialEq, PartialOrd};
 use std::collections::BinaryHeap;
 use std::io::Read;
 
+#[allow(clippy::upper_case_acronyms)]
 enum Status {
     Success(Block),
-    #[allow(clippy::clippy::upper_case_acronyms)]
     EOF,
 }
 
@@ -133,12 +133,11 @@ impl Readahead {
             let _ = self.used_block_sender.send(old_buf);
         }
         // eprintln!("3.7.");
-        let temp = match self.ready_to_processing_rx.recv().unwrap() {
+        match self.ready_to_processing_rx.recv().unwrap() {
             Status::Success(block) => Some(block),
             Status::EOF => None,
-        };
+        }
         // eprintln!("3.8.");
-        temp
     }
 }
 

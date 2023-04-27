@@ -39,12 +39,12 @@ pub(crate) fn extract_key<'a>(rec: &BAMRawRecord, buf: &'a [u8], sort_by: &SortB
 }
 
 fn create_key_tuple<'a>(name: &'a str, rec: &BAMRawRecord, sort_by: &SortBy) -> KeyTuple<'a> {
-    match sort_by {
-        &SortBy::Name => KeyTuple::Name(Cow::Borrowed(name)),
-        &SortBy::NameAndMatchMates => {
+    match *sort_by {
+        SortBy::Name => KeyTuple::Name(Cow::Borrowed(name)),
+        SortBy::NameAndMatchMates => {
             KeyTuple::NameAndMatchMates(Cow::Borrowed(name), rec.get_hit_count(), get_flag_val(rec))
         }
-        &SortBy::CoordinatesAndStrand => {
+        SortBy::CoordinatesAndStrand => {
             KeyTuple::CoordinatesAndStrand(get_ref_id(rec), get_pos(rec), is_reverse_strand(rec))
         }
     }
@@ -58,8 +58,8 @@ pub(crate) fn compare_read_names(lhs: &KeyTuple, rhs: &KeyTuple) -> Ordering {
 
 fn get_name<'a>(key_tuple: &'a KeyTuple) -> &'a str {
     match &key_tuple {
-        &KeyTuple::Name(str) => str,
-        &KeyTuple::NameAndMatchMates(str, _, _) => str,
+        KeyTuple::Name(str) => str,
+        KeyTuple::NameAndMatchMates(str, _, _) => str,
         _ => panic!("Variant {:?} does not have Name field.", key_tuple),
     }
 }
@@ -125,12 +125,12 @@ pub(crate) fn compare_coordinates_and_strand(left: &KeyTuple, right: &KeyTuple) 
         return Ordering::Less;
     }
     if refid_left != refid_right {
-        return refid_left.cmp(&refid_right);
+        return refid_left.cmp(refid_right);
     }
     let pos_left = extract_pos(left);
     let pos_right = extract_pos(right);
     if pos_left != pos_right {
-        return pos_left.cmp(&pos_right);
+        return pos_left.cmp(pos_right);
     }
     let is_reverse_strand_left = extract_is_reversed(left);
     let is_reverse_strand_right = extract_is_reversed(right);

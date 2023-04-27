@@ -4,8 +4,8 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crossbeam_channel::bounded;
 use lz4_flex;
 use rayon::prelude::ParallelSliceMut;
-use rayon::{self, ThreadPoolBuilder};
-use std::borrow::{Borrow, Cow};
+use rayon::{self};
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::slice::from_raw_parts;
 use std::thread;
@@ -17,14 +17,14 @@ use super::comparators::{
 
 use std::cmp::{max, min, Ordering};
 use std::collections::BinaryHeap;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tempdir::TempDir;
 
-static mut io_wait: Duration = Duration::from_secs(0);
+static mut IO_WAIT: Duration = Duration::from_secs(0);
 
 /// This struct manages buffer for unsorted reads
 // #[derive(Send)]
@@ -83,7 +83,7 @@ impl RecordsBuffer {
             }
         }
         unsafe {
-            io_wait += now.elapsed();
+            IO_WAIT += now.elapsed();
         }
         Ok(last_byte_offset)
     }
@@ -105,18 +105,17 @@ pub enum TempFilesMode {
 }
 
 /// Memory limit won't be strictly obeyed, but it probably won't be overflowed significantly.
+#[allow(clippy::too_many_arguments)]
 pub fn sort_bam<R: Read + Send + 'static, W: Write>(
     mem_limit: usize,
     reader: R,
     sorted_sink: &mut W,
     tmp_dir_path: PathBuf,
-    out_compr_level: usize,
-    sort_thread_num: usize,
+    _out_compr_level: usize,
     reader_thread_num: usize,
     temp_files_mode: TempFilesMode,
     sort_by: SortBy,
 ) -> std::io::Result<()> {
-    let decompress_thread_num = max(min(num_cpus::get(), sort_thread_num), 1);
     let reader_thread_num = max(min(num_cpus::get(), reader_thread_num), 1);
 
     let mut parallel_reader = Reader::new(reader, reader_thread_num);
@@ -128,7 +127,6 @@ pub fn sort_bam<R: Read + Send + 'static, W: Write>(
     let tmp_medium = read_split_sort_dump_chunks(
         &mut parallel_reader,
         mem_limit,
-        sort_thread_num,
         &tmp_dir,
         &temp_files_mode,
         sort_by,
@@ -144,7 +142,7 @@ pub fn sort_bam<R: Read + Send + 'static, W: Write>(
     unsafe {
         println!(
             "Elapsed time without IO in Rust sort: {:?}",
-            now.elapsed() - io_wait
+            now.elapsed() - IO_WAIT
         );
     }
     Ok(())
@@ -153,7 +151,6 @@ pub fn sort_bam<R: Read + Send + 'static, W: Write>(
 fn read_split_sort_dump_chunks(
     reader: &mut Reader,
     mem_limit: usize,
-    sort_thread_num: usize,
     tmp_dir: &TempDir,
     temp_files_mode: &TempFilesMode,
     sort_by: SortBy,
@@ -195,7 +192,7 @@ fn read_split_sort_dump_chunks(
             match *temp_files_mode {
                 TempFilesMode::RegularFiles | TempFilesMode::LZ4CompressedFiles => {
                     let file_name = temp_files_counter.to_string();
-                    let mut temp_file = make_tmp_file(&file_name, &tmp_dir).unwrap();
+                    let mut temp_file = make_tmp_file(&file_name, tmp_dir).unwrap();
                     dump(recs_buf.as_ref().unwrap(), &mut temp_file, temp_files_mode).unwrap();
                     temp_file.sync_all().unwrap();
                     temp_file.seek(SeekFrom::Start(0)).unwrap();
@@ -258,7 +255,7 @@ fn dump<W: Write>(
     //     write(buf, &mut buf_writer)?;
     // }
     unsafe {
-        io_wait += now.elapsed();
+        IO_WAIT += now.elapsed();
     }
     Ok(())
 }
@@ -377,8 +374,8 @@ impl<'a> MergeCandidate<'a> {
     ) -> Self {
         let ptr = buf.as_ptr();
         let rec_bytes = unsafe { from_raw_parts(ptr, buf.len()) };
-        let rec = BAMRawRecord(Cow::Borrowed(&rec_bytes[..]));
-        let key = extract_key(&rec, &rec_bytes[..], sort_by);
+        let rec = BAMRawRecord(Cow::Borrowed(rec_bytes));
+        let key = extract_key(&rec, rec_bytes, sort_by);
 
         Self {
             key,
@@ -400,7 +397,7 @@ impl<'a> MergeCandidate<'a> {
 impl<'a> PartialEq for MergeCandidate<'a> {
     fn eq(&self, other: &Self) -> bool {
         matches!(
-            (self.comparator)(&self.get_key(), &other.get_key()),
+            (self.comparator)(self.get_key(), other.get_key()),
             Ordering::Equal
         )
     }
@@ -411,12 +408,12 @@ impl<'a> Eq for MergeCandidate<'a> {}
 // WARNING: the assumption is made that A < B and B < C means A < C
 impl<'a> PartialOrd for MergeCandidate<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some((self.comparator)(&self.get_key(), &other.get_key()))
+        Some((self.comparator)(self.get_key(), other.get_key()))
     }
 }
 impl<'a> Ord for MergeCandidate<'a> {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.comparator)(&self.get_key(), &other.get_key())
+        (self.comparator)(self.get_key(), other.get_key())
     }
 }
 
@@ -483,7 +480,7 @@ impl<'a> NWayMerger<'a> {
             .unwrap()
         {
             unsafe {
-                io_wait += now.elapsed();
+                IO_WAIT += now.elapsed();
             }
             self.min_heap.push(Reverse(MergeCandidate::new(
                 used_buffer,
@@ -544,7 +541,7 @@ fn merge_sorted_chunks_and_write<W: Write>(
     let mut temp_buf = Vec::<u8>::new();
 
     unsafe {
-        io_wait += now.elapsed();
+        IO_WAIT += now.elapsed();
     }
     let mut prev;
 
@@ -552,7 +549,7 @@ fn merge_sorted_chunks_and_write<W: Write>(
         prev = now.elapsed();
         writer.write_all(&rec.0[..])?;
         unsafe {
-            io_wait += now.elapsed() - prev;
+            IO_WAIT += now.elapsed() - prev;
         }
         // Buffer rotation.
         temp_buf = rec.0.into_owned();
