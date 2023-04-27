@@ -30,7 +30,6 @@ use bam_tools::Reader;
 let mut bgzf_reader = Reader::new(reader, std::cmp::min(num_cpus::get(), 20));
 
 bgzf_reader.read_header().unwrap();
-bgzf_reader.consume_reference_sequences().unwrap();
 
 let mut records = bgzf_reader.records();
 while let Some(Ok(rec)) = records.next_rec() {
