@@ -284,20 +284,18 @@ fn make_tmp_file(file_name: &str, tmp_dir: &TempDir) -> std::io::Result<std::fs:
 
 // Struct which manages reading chunks from files
 struct ChunkReader {
-    inner: BufReader<File>,
+    inner: Box<dyn Read>,
 }
 
 enum ChunkReaderStatus {
     ReachedEOF,
     LoadedRecord,
 }
-
+//
 impl ChunkReader {
     // Creates new ChunkReader for temp file.
-    pub fn new(tmp_file: File, mem_limit: usize) -> Self {
-        Self {
-            inner: BufReader::with_capacity(mem_limit, tmp_file),
-        }
+    pub fn new(reader: Box<dyn Read>) -> Self {
+        Self { inner: reader }
     }
     // Reads bytes from inner reader into buffer.
     pub fn load_rec(&mut self, rec_buf: &mut Vec<u8>) -> std::io::Result<ChunkReaderStatus> {
@@ -466,15 +464,29 @@ fn merge_sorted_chunks_and_write<W: Write>(
     tmp_files: Vec<File>,
     sort_by: SortBy,
     writer: &mut W,
+    temp_files_are_compressed: bool,
 ) -> std::io::Result<()> {
     let num_chunks = tmp_files.len();
     let input_buf_mem_limit = min(16 * MEGA_BYTE_SIZE, mem_limit / 4 / num_chunks);
 
     let now = Instant::now();
-    let chunks_readers: Vec<ChunkReader> = tmp_files
-        .into_iter()
-        .map(|tmp_file| ChunkReader::new(tmp_file, input_buf_mem_limit))
-        .collect();
+
+    let mut chunks_readers = Vec::new();
+    for tmp in tmp_files {
+        if temp_files_are_compressed {
+            chunks_readers.push(ChunkReader::new(Box::new(
+                lz4_flex::frame::FrameDecoder::new(BufReader::with_capacity(
+                    input_buf_mem_limit,
+                    tmp,
+                )),
+            )));
+        } else {
+            chunks_readers.push(ChunkReader::new(Box::new(BufReader::with_capacity(
+                input_buf_mem_limit,
+                tmp,
+            ))));
+        };
+    }
 
     let comparator = get_comparator(sort_by);
     let mut merger = NWayMerger::new(chunks_readers, &comparator, sort_by);
