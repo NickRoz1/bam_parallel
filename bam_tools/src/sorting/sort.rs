@@ -1,13 +1,14 @@
 use crate::record::bamrawrecord::BAMRawRecord;
 use crate::{Reader, MEGA_BYTE_SIZE};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use flume::Sender;
+use crossbeam_channel::bounded;
 use lz4_flex;
 use rayon::prelude::ParallelSliceMut;
 use rayon::{self, ThreadPoolBuilder};
 use std::borrow::{Borrow, Cow};
 use std::cmp::Reverse;
 use std::slice::from_raw_parts;
+use std::thread;
 
 use super::comparators::{
     compare_coordinates_and_strand, compare_read_names, compare_read_names_and_mates, extract_key,
@@ -157,13 +158,15 @@ fn read_split_sort_dump_chunks(
     temp_files_mode: &TempFilesMode,
     sort_by: SortBy,
 ) -> Vec<Box<dyn Read>> {
-    let (buf_send, buf_recv) = flume::unbounded();
+    let (work_send, work_receive) = bounded(1);
+    let (result_send, result_receive) = bounded(1);
     let mut recs_buf = Some(RecordsBuffer::new(mem_limit / 2));
 
-    let thread_pool = ThreadPoolBuilder::new()
-        .num_threads(sort_thread_num)
-        .build()
-        .unwrap();
+    let sort_thread_handle = thread::spawn(move || {
+        for buf in work_receive {
+            result_send.send(sort_chunk(buf, sort_by)).unwrap();
+        }
+    });
 
     let mut temp_medium = Vec::<Box<dyn Read>>::new();
     let mut temp_files_counter = 0;
@@ -175,19 +178,18 @@ fn read_split_sort_dump_chunks(
     }
 
     let taken_buf = recs_buf.take().unwrap();
-    let send_channel = buf_send.clone();
-    thread_pool.spawn(move || sort_chunk(taken_buf, send_channel, sort_by));
+    work_send.send(taken_buf).unwrap();
+
     // While one buffer is being sorted this one will be loaded with data.
     recs_buf = Some(RecordsBuffer::new(mem_limit / 2));
 
     while let Ok(bytes_read) = recs_buf.as_mut().unwrap().fill(reader) {
         if bytes_read != 0 {
             let taken_buf = recs_buf.take().unwrap();
-            let send_channel = buf_send.clone();
-            thread_pool.spawn(move || sort_chunk(taken_buf, send_channel, sort_by));
+            work_send.send(taken_buf).unwrap();
         }
 
-        recs_buf = Some(buf_recv.recv().unwrap());
+        recs_buf = Some(result_receive.recv().unwrap());
 
         if !recs_buf.as_ref().unwrap().records.is_empty() {
             match *temp_files_mode {
@@ -217,20 +219,8 @@ fn read_split_sort_dump_chunks(
         }
     }
 
-    // let last_buf = buf_recv.recv().unwrap();
-    // // One can optimize this so when there is no temp files written (there is
-    // // only one chunk in file) it's written straight to the resulting file, but
-    // // it's probably not worth it.
-    // let file_name = temp_files_counter.to_string();
-    // let mut temp_file = make_tmp_file(&file_name, &tmp_dir).unwrap();
-    // dump(&last_buf, &mut temp_file, temp_files_mode).unwrap();
-    // temp_files.push(temp_file);
-
-    // Ensure all buffered data is written and move cursors to the beginning of the files.
-    // for temp_file in temp_files.iter_mut() {
-    //     temp_file.sync_all().unwrap();
-    //     temp_file.seek(SeekFrom::Start(0)).unwrap();
-    // }
+    drop(work_send);
+    sort_thread_handle.join().unwrap();
 
     temp_medium
 }
@@ -284,7 +274,7 @@ fn write<W: Write>(buf: &RecordsBuffer, writer: &mut W) -> std::io::Result<()> {
 
 // For each byte range construct record wrapper, sort records and then reorder
 // the ranges to write byte ranges into file in sorted order.
-fn sort_chunk(mut buf: RecordsBuffer, buf_return: Sender<RecordsBuffer>, sort_by: SortBy) {
+fn sort_chunk(mut buf: RecordsBuffer, sort_by: SortBy) -> RecordsBuffer {
     let mut sorting_keys: Vec<(KeyTuple, Range<usize>)> = Vec::new();
     for range in buf.records {
         let rec_wrapper = BAMRawRecord(std::borrow::Cow::Borrowed(
@@ -303,7 +293,7 @@ fn sort_chunk(mut buf: RecordsBuffer, buf_return: Sender<RecordsBuffer>, sort_by
     // The BAMRawRecords and their corresponding ranges are now in
     // order. Replace original ranges with the sorted ones.
     buf.records = sorting_keys.into_iter().map(|rec| rec.1).collect();
-    buf_return.send(buf).unwrap();
+    buf
 }
 
 fn get_tuple_comparator(
