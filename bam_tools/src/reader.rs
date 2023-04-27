@@ -3,7 +3,7 @@ mod records;
 
 use crate::block::Block;
 use crate::MAGIC_NUMBER;
-use byteorder::{LittleEndian, ReadBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::ffi::CStr;
 use std::io;
 
@@ -61,7 +61,7 @@ impl Reader {
         Records::new(self)
     }
 
-    pub fn read_header(&mut self) -> io::Result<String> {
+    pub fn read_header(&mut self) -> io::Result<(Vec<u8>, usize)> {
         let magic = read_magic(self)?;
 
         if magic != MAGIC_NUMBER {
@@ -73,19 +73,19 @@ impl Reader {
 
         read_header(self)
     }
+}
 
-    pub fn parse_reference_sequences(&mut self) -> io::Result<Vec<(String, i32)>> {
-        let n_ref = self.read_u32::<LittleEndian>().and_then(|n| {
-            usize::try_from(n).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-        })?;
+pub fn parse_reference_sequences(mut bytes: &[u8]) -> io::Result<Vec<(String, u32)>> {
+    let n_ref = bytes.read_u32::<LittleEndian>().and_then(|n| {
+        usize::try_from(n).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    })?;
 
-        let mut vec = Vec::new();
-        for _ in 0..n_ref {
-            vec.push(parse_reference_sequence(self)?);
-        }
-
-        Ok(vec)
+    let mut vec = Vec::new();
+    for _ in 0..n_ref {
+        vec.push(parse_reference_sequence(&mut bytes)?);
     }
+
+    Ok(vec)
 }
 
 impl Read for Reader {
@@ -126,22 +126,43 @@ where
     Ok(magic)
 }
 
-fn read_header<R>(reader: &mut R) -> io::Result<String>
+/// Parses header fully into byte buffer. Returns header as a byte buffer and offset to reference `n_ref` in
+/// this buffer (to ease subsequent ref_seq parsing).
+fn read_header<R>(reader: &mut R) -> io::Result<(Vec<u8>, usize)>
 where
     R: Read,
 {
-    let l_text = reader.read_u32::<LittleEndian>().and_then(|n| {
-        usize::try_from(n).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    })?;
+    let mut bytes = Vec::new();
 
-    let mut text = vec![0; l_text];
-    reader.read_exact(&mut text)?;
+    let l_text = reader.read_u32::<LittleEndian>().unwrap();
+    bytes.write_u32::<LittleEndian>(l_text).unwrap();
+    bytes.resize(std::mem::size_of::<u32>() + l_text as usize, 0);
+    reader.read_exact(&mut bytes[std::mem::size_of::<u32>()..])?;
+
+    let offset_to_ref_seqs = bytes.len();
+
+    let n_ref = reader.read_u32::<LittleEndian>().unwrap();
+    bytes.write_u32::<LittleEndian>(n_ref).unwrap();
+
+    for _ in 0..n_ref {
+        let l_name = reader.read_u32::<LittleEndian>().unwrap();
+        bytes.write_u32::<LittleEndian>(l_name).unwrap();
+
+        let cur_len = bytes.len();
+        bytes.resize(cur_len + l_name as usize, 0);
+        reader.read_exact(&mut bytes[cur_len..])?;
+
+        let _l_ref = reader.read_u32::<LittleEndian>().unwrap();
+        bytes.write_u32::<LittleEndian>(_l_ref).unwrap();
+    }
 
     // § 4.2 The BAM format (2021-06-03): "Plain header text in SAM; not necessarily
     // NUL-terminated".
-    bytes_with_nul_to_string(&text).or_else(|_| {
-        String::from_utf8(text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    })
+    // bytes_with_nul_to_string(&text).or_else(|_| {
+    //     String::from_utf8(text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    // })
+
+    Ok((bytes, offset_to_ref_seqs))
 }
 
 fn bytes_with_nul_to_string(buf: &[u8]) -> io::Result<String> {
@@ -155,7 +176,7 @@ fn bytes_with_nul_to_string(buf: &[u8]) -> io::Result<String> {
         })
 }
 
-fn parse_reference_sequence<R>(reader: &mut R) -> io::Result<(String, i32)>
+fn parse_reference_sequence<R>(reader: &mut R) -> io::Result<(String, u32)>
 where
     R: Read,
 {
@@ -167,9 +188,7 @@ where
     reader.read_exact(&mut c_name)?;
 
     let _name = bytes_with_nul_to_string(&c_name)?;
-    let _l_ref = reader.read_u32::<LittleEndian>().and_then(|len| {
-        i32::try_from(len).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    })?;
+    let _l_ref = reader.read_u32::<LittleEndian>().unwrap();
 
     Ok((_name, _l_ref))
 }

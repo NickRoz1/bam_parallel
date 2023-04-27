@@ -16,7 +16,7 @@ use structopt::StructOpt;
 #[structopt(name = "BAM parallel CLI")]
 struct Opt {
     #[structopt(short = "q", long)]
-    quite_mode: bool,
+    _quite_mode: bool,
 
     /// Input file
     #[structopt(short = "i", parse(from_os_str))]
@@ -69,8 +69,7 @@ fn main() {
         tmp_dir_path,
         0,
         5,
-        5,
-        false,
+        bam_tools::sorting::sort::TempFilesMode::RegularFiles,
         sort_by,
     )
     .unwrap();
@@ -84,7 +83,6 @@ fn generate_file_hash<R: Read + Send + 'static>(reader: R) -> String {
     let mut hasher = Md5::new();
 
     bgzf_reader.read_header().unwrap();
-    bgzf_reader.parse_reference_sequences().unwrap();
 
     let mut records = bgzf_reader.records();
     while let Some(Ok(rec)) = records.next_rec() {

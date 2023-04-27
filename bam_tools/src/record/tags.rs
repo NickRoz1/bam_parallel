@@ -119,7 +119,7 @@ pub fn get_hit_count(data: &[u8]) -> Option<i32> {
             TagType::C => tag.read_u8().unwrap() as i32,
             TagType::s => tag.read_i16::<LittleEndian>().unwrap() as i32,
             TagType::S => tag.read_u16::<LittleEndian>().unwrap() as i32,
-            TagType::i => tag.read_i32::<LittleEndian>().unwrap() as i32,
+            TagType::i => tag.read_i32::<LittleEndian>().unwrap(),
             TagType::I => tag.read_u32::<LittleEndian>().unwrap() as i32,
             _ => panic!("The tag type {:?} can't contain hit count value.", tag_type),
         };

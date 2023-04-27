@@ -24,6 +24,7 @@ pub mod record {
 }
 
 use block::Block;
+pub use reader::parse_reference_sequences;
 pub use reader::Reader;
 use std::mem;
 use virtual_position::VirtualPosition;
