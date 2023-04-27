@@ -17,7 +17,7 @@ use super::comparators::{
 use std::cmp::{max, min, Ordering};
 use std::collections::BinaryHeap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -96,6 +96,13 @@ pub enum SortBy {
     CoordinatesAndStrand,
 }
 
+pub enum TempFilesMode {
+    RegularFiles,
+    LZ4CompressedFiles,
+    InMemoryBlocks,
+    InMemoryBlocksLZ4,
+}
+
 /// Memory limit won't be strictly obeyed, but it probably won't be overflowed significantly.
 pub fn sort_bam<R: Read + Send + 'static, W: Write>(
     mem_limit: usize,
@@ -105,7 +112,7 @@ pub fn sort_bam<R: Read + Send + 'static, W: Write>(
     out_compr_level: usize,
     sort_thread_num: usize,
     reader_thread_num: usize,
-    compress_temp_files: bool,
+    temp_files_mode: TempFilesMode,
     sort_by: SortBy,
 ) -> std::io::Result<()> {
     let decompress_thread_num = max(min(num_cpus::get(), sort_thread_num), 1);
@@ -113,21 +120,26 @@ pub fn sort_bam<R: Read + Send + 'static, W: Write>(
 
     let mut parallel_reader = Reader::new(reader, reader_thread_num);
     parallel_reader.read_header().unwrap();
-    parallel_reader.parse_reference_sequences().unwrap();
 
     let tmp_dir = TempDir::new_in(tmp_dir_path, "BAM sort temporary directory.").unwrap();
 
     let now = Instant::now();
-    let tmp_files = read_split_sort_dump_chunks(
+    let tmp_medium = read_split_sort_dump_chunks(
         &mut parallel_reader,
         mem_limit,
         sort_thread_num,
         &tmp_dir,
-        compress_temp_files,
+        &temp_files_mode,
         sort_by,
     );
 
-    merge_sorted_chunks_and_write(mem_limit, tmp_files, sort_by, sorted_sink)?;
+    merge_sorted_chunks_and_write(
+        mem_limit,
+        tmp_medium,
+        sort_by,
+        sorted_sink,
+        &temp_files_mode,
+    )?;
     unsafe {
         println!(
             "Elapsed time without IO in Rust sort: {:?}",
@@ -142,9 +154,9 @@ fn read_split_sort_dump_chunks(
     mem_limit: usize,
     sort_thread_num: usize,
     tmp_dir: &TempDir,
-    compress_temp_files: bool,
+    temp_files_mode: &TempFilesMode,
     sort_by: SortBy,
-) -> Vec<File> {
+) -> Vec<Box<dyn Read>> {
     let (buf_send, buf_recv) = flume::unbounded();
     let mut recs_buf = Some(RecordsBuffer::new(mem_limit / 2));
 
@@ -153,7 +165,7 @@ fn read_split_sort_dump_chunks(
         .build()
         .unwrap();
 
-    let mut temp_files = Vec::<File>::new();
+    let mut temp_medium = Vec::<Box<dyn Read>>::new();
     let mut temp_files_counter = 0;
 
     // Load first chunk to start the cycle.
@@ -169,55 +181,92 @@ fn read_split_sort_dump_chunks(
     recs_buf = Some(RecordsBuffer::new(mem_limit / 2));
 
     while let Ok(bytes_read) = recs_buf.as_mut().unwrap().fill(reader) {
+        if bytes_read != 0 {
+            let taken_buf = recs_buf.take().unwrap();
+            let send_channel = buf_send.clone();
+            thread_pool.spawn(move || sort_chunk(taken_buf, send_channel, sort_by));
+        }
+
+        recs_buf = Some(buf_recv.recv().unwrap());
+
+        if !recs_buf.as_ref().unwrap().records.is_empty() {
+            match *temp_files_mode {
+                TempFilesMode::RegularFiles | TempFilesMode::LZ4CompressedFiles => {
+                    let file_name = temp_files_counter.to_string();
+                    let mut temp_file = make_tmp_file(&file_name, &tmp_dir).unwrap();
+                    dump(recs_buf.as_ref().unwrap(), &mut temp_file, temp_files_mode).unwrap();
+                    temp_file.sync_all().unwrap();
+                    temp_file.seek(SeekFrom::Start(0)).unwrap();
+                    temp_medium.push(Box::new(temp_file));
+                    temp_files_counter += 1;
+                }
+                TempFilesMode::InMemoryBlocks | TempFilesMode::InMemoryBlocksLZ4 => {
+                    let mut vec = Vec::new();
+                    // 1GB of BAM data occupies approximately 520-600 MB if compressed with LZ4.
+                    vec.reserve(MEGA_BYTE_SIZE * 640);
+                    let mut cursor = Cursor::new(vec);
+                    dump(recs_buf.as_ref().unwrap(), &mut cursor, temp_files_mode).unwrap();
+                    cursor.set_position(0);
+                    temp_medium.push(Box::new(cursor));
+                }
+            }
+        }
+
         if bytes_read == 0 {
             break;
         }
-
-        let taken_buf = recs_buf.take().unwrap();
-        let send_channel = buf_send.clone();
-        thread_pool.spawn(move || sort_chunk(taken_buf, send_channel, sort_by));
-        recs_buf = Some(buf_recv.recv().unwrap());
-
-        let file_name = temp_files_counter.to_string();
-        let mut temp_file = make_tmp_file(&file_name, &tmp_dir).unwrap();
-        dump(
-            recs_buf.as_ref().unwrap(),
-            &mut temp_file,
-            compress_temp_files,
-        )
-        .unwrap();
-        temp_files.push(temp_file);
-        temp_files_counter += 1;
     }
 
-    let last_buf = buf_recv.recv().unwrap();
-    // One can optimize this so when there is no temp files written (there is
-    // only one chunk in file) it's written straight to the resulting file, but
-    // it's probably not worth it.
-    let file_name = temp_files_counter.to_string();
-    let mut temp_file = make_tmp_file(&file_name, &tmp_dir).unwrap();
-    dump(&last_buf, &mut temp_file, compress_temp_files).unwrap();
-    temp_files.push(temp_file);
+    // let last_buf = buf_recv.recv().unwrap();
+    // // One can optimize this so when there is no temp files written (there is
+    // // only one chunk in file) it's written straight to the resulting file, but
+    // // it's probably not worth it.
+    // let file_name = temp_files_counter.to_string();
+    // let mut temp_file = make_tmp_file(&file_name, &tmp_dir).unwrap();
+    // dump(&last_buf, &mut temp_file, temp_files_mode).unwrap();
+    // temp_files.push(temp_file);
 
     // Ensure all buffered data is written and move cursors to the beginning of the files.
-    for temp_file in temp_files.iter_mut() {
-        temp_file.sync_all().unwrap();
-        temp_file.seek(SeekFrom::Start(0)).unwrap();
-    }
+    // for temp_file in temp_files.iter_mut() {
+    //     temp_file.sync_all().unwrap();
+    //     temp_file.seek(SeekFrom::Start(0)).unwrap();
+    // }
 
-    temp_files
+    temp_medium
 }
 
-fn dump(buf: &RecordsBuffer, file: &mut File, compress_temp_files: bool) -> std::io::Result<()> {
+fn dump<W: Write>(
+    buf: &RecordsBuffer,
+    sink: &mut W,
+    temp_files_mode: &TempFilesMode,
+) -> std::io::Result<()> {
     let now = Instant::now();
-    let mut buf_writer = BufWriter::new(file);
-    if compress_temp_files {
-        let mut wrt = lz4_flex::frame::FrameEncoder::new(buf_writer);
-        write(buf, &mut wrt)?;
-        wrt.finish().unwrap();
-    } else {
-        write(buf, &mut buf_writer)?;
+    match temp_files_mode {
+        TempFilesMode::RegularFiles => {
+            write(buf, &mut BufWriter::new(sink))?;
+        }
+        TempFilesMode::LZ4CompressedFiles => {
+            let mut wrt = lz4_flex::frame::FrameEncoder::new(BufWriter::new(sink));
+            write(buf, &mut wrt)?;
+            wrt.finish().unwrap();
+        }
+        TempFilesMode::InMemoryBlocks => {
+            write(buf, sink).unwrap();
+        }
+        TempFilesMode::InMemoryBlocksLZ4 => {
+            let mut wrt = lz4_flex::frame::FrameEncoder::new(BufWriter::new(sink));
+            write(buf, &mut wrt)?;
+            wrt.finish().unwrap();
+        }
     }
+    // let mut buf_writer = BufWriter::new(file);
+    // if compress_temp_files {
+    //     let mut wrt = lz4_flex::frame::FrameEncoder::new(buf_writer);
+    //     write(buf, &mut wrt)?;
+    //     wrt.finish().unwrap();
+    // } else {
+    //     write(buf, &mut buf_writer)?;
+    // }
     unsafe {
         io_wait += now.elapsed();
     }
@@ -461,31 +510,42 @@ impl<'a> NWayMerger<'a> {
 /// buffers (not the reader buffer) which temporarily holds record.
 fn merge_sorted_chunks_and_write<W: Write>(
     mem_limit: usize,
-    tmp_files: Vec<File>,
+    tmp_medium: Vec<Box<dyn Read>>,
     sort_by: SortBy,
     writer: &mut W,
-    temp_files_are_compressed: bool,
+    temp_files_are_compressed: &TempFilesMode,
 ) -> std::io::Result<()> {
-    let num_chunks = tmp_files.len();
+    let num_chunks = tmp_medium.len();
     let input_buf_mem_limit = min(16 * MEGA_BYTE_SIZE, mem_limit / 4 / num_chunks);
 
     let now = Instant::now();
 
     let mut chunks_readers = Vec::new();
-    for tmp in tmp_files {
-        if temp_files_are_compressed {
-            chunks_readers.push(ChunkReader::new(Box::new(
-                lz4_flex::frame::FrameDecoder::new(BufReader::with_capacity(
+    for tmp in tmp_medium {
+        match temp_files_are_compressed {
+            TempFilesMode::RegularFiles => {
+                chunks_readers.push(ChunkReader::new(Box::new(BufReader::with_capacity(
                     input_buf_mem_limit,
                     tmp,
-                )),
-            )));
-        } else {
-            chunks_readers.push(ChunkReader::new(Box::new(BufReader::with_capacity(
-                input_buf_mem_limit,
-                tmp,
-            ))));
-        };
+                ))));
+            }
+            TempFilesMode::LZ4CompressedFiles => {
+                chunks_readers.push(ChunkReader::new(Box::new(
+                    lz4_flex::frame::FrameDecoder::new(BufReader::with_capacity(
+                        input_buf_mem_limit,
+                        tmp,
+                    )),
+                )));
+            }
+            TempFilesMode::InMemoryBlocks => {
+                chunks_readers.push(ChunkReader::new(tmp));
+            }
+            TempFilesMode::InMemoryBlocksLZ4 => {
+                chunks_readers.push(ChunkReader::new(Box::new(
+                    lz4_flex::frame::FrameDecoder::new(tmp),
+                )));
+            }
+        }
     }
 
     let comparator = get_comparator(sort_by);
