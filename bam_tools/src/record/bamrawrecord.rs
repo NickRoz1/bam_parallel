@@ -104,6 +104,10 @@ impl<'a> BAMRawRecord<'a> {
         }
     }
 
+    pub(crate) fn get_name(&self) -> &str {
+        unsafe { std::str::from_utf8_unchecked(self.get_bytes(&Fields::ReadName)) }
+    }
+
     // Calculates range of bytes containing specified field.
     pub fn get_range(&self, field: &Fields) -> std::ops::Range<usize> {
         match field {
