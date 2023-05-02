@@ -108,6 +108,12 @@ impl<'a> BAMRawRecord<'a> {
         unsafe { std::str::from_utf8_unchecked(self.get_bytes(&Fields::ReadName)) }
     }
 
+    pub(crate) fn get_refid(&self) -> i32 {
+        self.get_bytes(&Fields::RefID)
+            .read_i32::<LittleEndian>()
+            .unwrap()
+    }
+
     // Calculates range of bytes containing specified field.
     pub fn get_range(&self, field: &Fields) -> std::ops::Range<usize> {
         match field {
