@@ -110,7 +110,7 @@ pub fn sort_bam<R: Read + Send + 'static, W: Write>(
     mem_limit: usize,
     reader: R,
     sorted_sink: &mut W,
-    tmp_dir_path: PathBuf,
+    tmp_dir: &TempDir,
     _out_compr_level: usize,
     reader_thread_num: usize,
     temp_files_mode: TempFilesMode,
@@ -121,7 +121,6 @@ pub fn sort_bam<R: Read + Send + 'static, W: Write>(
     let mut parallel_reader = Reader::new(reader, reader_thread_num);
     parallel_reader.read_header().unwrap();
 
-    let tmp_dir = TempDir::new_in(tmp_dir_path, "BAM sort temporary directory.").unwrap();
 
     let now = Instant::now();
     let tmp_medium = read_split_sort_dump_chunks(
