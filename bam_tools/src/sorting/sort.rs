@@ -11,8 +11,8 @@ use std::slice::from_raw_parts;
 use std::thread;
 
 use super::comparators::{
-    compare_coordinates_and_strand, compare_read_names, compare_read_names_and_mates, extract_key,
-    KeyTuple,
+    compare_coordinates_and_strand, compare_read_names, compare_read_names_and_mates,
+    create_key_tuple, extract_key, KeyTuple,
 };
 
 use std::cmp::{max, min, Ordering};
@@ -22,7 +22,6 @@ use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 use tempdir::TempDir;
-
 static mut IO_WAIT: Duration = Duration::from_secs(0);
 
 /// This struct manages buffer for unsorted reads
@@ -103,6 +102,37 @@ pub enum TempFilesMode {
     InMemoryBlocksLZ4,
 }
 
+/// Only coordinate sort is currently supported.
+fn do_index_sort<W: Write, IndexW: std::io::Write>(
+    bam_reader: &mut Reader,
+    mut writer: &mut W,
+    mut index_writer: &mut IndexW,
+) -> std::io::Result<()> {
+    let temp_me = Instant::now();
+    let mut records = bam_reader.records();
+    let mut all_keys: Vec<(KeyTuple, Range<usize>)> = Vec::new();
+    all_keys.reserve(500_000_000);
+    let mut i = 0;
+    while let Some(Ok(rec)) = records.next_rec() {
+        let wrapper = BAMRawRecord(Cow::Borrowed(rec));
+        let key = create_key_tuple("", &wrapper, &SortBy::CoordinatesAndStrand);
+        all_keys.push((key, i..i));
+        writer.write_all(&rec[..])?;
+        i += 1;
+    }
+
+    dbg!("The file has been converted to GBAM. Now sorting keytuples and creating the index. Curtimestamp: {}", (Instant::now()-temp_me).as_millis());
+
+    all_keys[..].par_sort_by(get_tuple_comparator(SortBy::CoordinatesAndStrand));
+
+    for (_, rng) in all_keys {
+        index_writer
+            .write_u32::<LittleEndian>(rng.start as u32)
+            .unwrap();
+    }
+    return Ok(());
+}
+
 /// Memory limit won't be strictly obeyed, but it probably won't be overflowed significantly.
 #[allow(clippy::too_many_arguments)]
 pub fn sort_bam<R: Read + Send + 'static, W: Write, IndexW: Write>(
@@ -124,54 +154,38 @@ pub fn sort_bam<R: Read + Send + 'static, W: Write, IndexW: Write>(
 
     let now = Instant::now();
 
-    let is_index_sort = index_file_to_create.is_some();
     let sort_time = Instant::now();
-    let tmp_medium = if is_index_sort {
-        read_split_sort_dump_chunks(
-            &mut parallel_reader,
-            mem_limit,
-            &tmp_dir,
-            &temp_files_mode,
-            Some(sorted_sink),
-            sort_by,
-        )
+    let tmp_medium = if let Some(mut index_file) = index_file_to_create {
+        do_index_sort(&mut parallel_reader, sorted_sink, &mut index_file);
+        None
     } else {
-        read_split_sort_dump_chunks::<W>(
+        Some(read_split_sort_dump_chunks::<W>(
             &mut parallel_reader,
             mem_limit,
             &tmp_dir,
             &temp_files_mode,
             None,
             sort_by,
-        )
+        ))
     };
 
-    let it_took_to_sort = Instant::now()-sort_time;
+    let it_took_to_sort = Instant::now() - sort_time;
     println!("Spent in sort step: {:?}", it_took_to_sort);
 
     let temp_me = Instant::now();
 
-    if is_index_sort {
+    if let Some(tmp) = tmp_medium {
         merge_sorted_chunks_and_write(
             mem_limit,
-            tmp_medium,
-            sort_by,
-            index_file_to_create.as_mut().unwrap(),
-            &temp_files_mode,
-            is_index_sort,
-        )?;
-    } else {
-        merge_sorted_chunks_and_write(
-            mem_limit,
-            tmp_medium,
+            tmp,
             sort_by,
             sorted_sink,
             &temp_files_mode,
-            is_index_sort,
+            false,
         )?;
     }
 
-    let mywait = Instant::now()-temp_me;
+    let mywait = Instant::now() - temp_me;
     println!("Spent in merge step: {:?}", mywait);
     unsafe {
         println!(
