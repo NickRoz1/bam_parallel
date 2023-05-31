@@ -137,8 +137,10 @@ pub(crate) fn compare_coordinates_and_strand(left: &KeyTuple, right: &KeyTuple) 
 
     if !is_reverse_strand_left && *is_reverse_strand_right {
         Ordering::Less
-    } else {
+    } else if *is_reverse_strand_left && !is_reverse_strand_right {
         Ordering::Greater
+    } else {
+        Ordering::Equal
     }
 }
 

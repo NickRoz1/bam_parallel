@@ -121,7 +121,6 @@ pub fn sort_bam<R: Read + Send + 'static, W: Write>(
     let mut parallel_reader = Reader::new(reader, reader_thread_num);
     parallel_reader.read_header().unwrap();
 
-
     let now = Instant::now();
     let tmp_medium = read_split_sort_dump_chunks(
         &mut parallel_reader,
@@ -384,8 +383,8 @@ impl<'a> MergeCandidate<'a> {
         }
     }
 
-    pub fn get_key(&self) -> &KeyTuple {
-        &self.key
+    pub fn get_key(&self) -> (&KeyTuple, usize) {
+        (&self.key, self.provider_idx)
     }
 
     pub fn get_data(self) -> Vec<u8> {
@@ -395,10 +394,12 @@ impl<'a> MergeCandidate<'a> {
 
 impl<'a> PartialEq for MergeCandidate<'a> {
     fn eq(&self, other: &Self) -> bool {
-        matches!(
-            (self.comparator)(self.get_key(), other.get_key()),
-            Ordering::Equal
-        )
+        assert!(false);
+        false
+        // matches!(
+        //     (self.comparator)(self.get_key(), other.get_key()),
+        //     Ordering::Equal
+        // )
     }
 }
 
@@ -407,12 +408,26 @@ impl<'a> Eq for MergeCandidate<'a> {}
 // WARNING: the assumption is made that A < B and B < C means A < C
 impl<'a> PartialOrd for MergeCandidate<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some((self.comparator)(self.get_key(), other.get_key()))
+        let lhs = self.get_key();
+        let rhs = other.get_key();
+        let res = (self.comparator)(lhs.0, rhs.0);
+        if let Ordering::Equal = res {
+            Some(lhs.1.cmp(&rhs.1))
+        } else {
+            Some(res)
+        }
     }
 }
 impl<'a> Ord for MergeCandidate<'a> {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.comparator)(self.get_key(), other.get_key())
+        let lhs = self.get_key();
+        let rhs = other.get_key();
+        let res = (self.comparator)(lhs.0, rhs.0);
+        if let Ordering::Equal = res {
+            lhs.1.cmp(&rhs.1)
+        } else {
+            res
+        }
     }
 }
 
