@@ -45,7 +45,11 @@ fn create_key_tuple<'a>(name: &'a str, rec: &BAMRawRecord, sort_by: &SortBy) -> 
             KeyTuple::NameAndMatchMates(Cow::Borrowed(name), rec.get_hit_count(), get_flag_val(rec))
         }
         SortBy::CoordinatesAndStrand => {
-            KeyTuple::CoordinatesAndStrand(get_ref_id(rec), get_pos(rec), is_reverse_strand(rec))
+            let mut id = get_ref_id(rec);
+            if id == -1 {
+                id = i32::MAX;
+            }
+            KeyTuple::CoordinatesAndStrand(id, get_pos(rec), is_reverse_strand(rec))
         }
     }
 }
@@ -118,12 +122,6 @@ pub(crate) fn compare_coordinates_and_strand(left: &KeyTuple, right: &KeyTuple) 
     }
     let refid_left = extract_ref_id(left);
     let refid_right = extract_ref_id(right);
-    if *refid_left == -1 {
-        return Ordering::Greater;
-    }
-    if *refid_right == -1 {
-        return Ordering::Less;
-    }
     if refid_left != refid_right {
         return refid_left.cmp(refid_right);
     }
