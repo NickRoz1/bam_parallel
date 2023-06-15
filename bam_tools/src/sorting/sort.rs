@@ -106,7 +106,7 @@ pub enum TempFilesMode {
 
 /// Memory limit won't be strictly obeyed, but it probably won't be overflowed significantly.
 #[allow(clippy::too_many_arguments)]
-pub fn sort_bam<R: Read + Send + 'static, W: Write>(
+pub fn sort_bam<R: Read + Send + Sync + 'static, W: Write>(
     mem_limit: usize,
     reader: R,
     sorted_sink: &mut W,

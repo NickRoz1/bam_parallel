@@ -4,6 +4,7 @@ use bam_tools::Reader;
 use bam_tools::MEGA_BYTE_SIZE;
 use md5::{Digest, Md5};
 use std::env;
+use tempdir::TempDir;
 
 use std::fs::File;
 use std::io::BufReader;
@@ -61,12 +62,13 @@ fn main() {
     let out_file = File::create(opt.output.unwrap()).unwrap();
     let mut writer = BufWriter::new(out_file);
     let tmp_dir_path = env::temp_dir();
+    let dir = TempDir::new_in(tmp_dir_path, "BAM sort temporary directory.").unwrap();
 
     sort_bam(
         2000 * MEGA_BYTE_SIZE,
         reader,
         &mut writer,
-        tmp_dir_path,
+        &dir,
         0,
         5,
         bam_tools::sorting::sort::TempFilesMode::RegularFiles,
@@ -77,7 +79,7 @@ fn main() {
     std::process::exit(0);
 }
 
-fn generate_file_hash<R: Read + Send + 'static>(reader: R) -> String {
+fn generate_file_hash<R: Read + Send + Sync + 'static>(reader: R) -> String {
     let mut bgzf_reader = Reader::new(reader, std::cmp::min(num_cpus::get(), 20));
 
     let mut hasher = Md5::new();
