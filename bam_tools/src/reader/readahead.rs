@@ -7,7 +7,7 @@ use rayon::spawn;
 use std::cmp::{Ord, Ordering, PartialEq, PartialOrd};
 use std::collections::BinaryHeap;
 use std::io::Read;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
 #[allow(clippy::upper_case_acronyms)]
@@ -58,20 +58,45 @@ impl Readahead {
 
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
+        // Due to I/O unpredictable nature, it may happen that two or more threads would race to lock a mutex on a reader
+        // making uncompressed block stream unordered. Ensure order with condvar.
+        let cond_var_for_order: Arc<(Mutex<usize>, Condvar)> =
+            Arc::new((Mutex::new(0), Condvar::new()));
+
         let mutex_protected_reader = Arc::new(Mutex::new(reader));
-        for _ in 0..thread_num {
+        for i in 0..thread_num {
             let (block_sender, block_receiver) = flume::bounded(1);
             let (uncompressed_sender, uncompressed_receiver) = flume::bounded(1);
             let clone_of_reader = mutex_protected_reader.clone();
+            let cond_var_for_this_thread = cond_var_for_order.clone();
             let thread = thread::spawn(move || {
                 let mut read_buf = Vec::new();
+
                 for mut block in block_receiver {
-                    let bytes_count = fetch_block(
-                        clone_of_reader.lock().unwrap().as_mut(),
-                        &mut read_buf,
-                        &mut block,
-                    )
-                    .unwrap();
+                    let bytes_count = {
+                        let (lock, cvar) = &*cond_var_for_this_thread;
+                        let mut my_turn = lock.lock().unwrap();
+
+                        while *my_turn != i {
+                            my_turn = cvar.wait(my_turn).unwrap();
+                        }
+
+                        let read_bytes = fetch_block(
+                            clone_of_reader.lock().unwrap().as_mut(),
+                            &mut read_buf,
+                            &mut block,
+                        )
+                        .unwrap();
+
+                        *my_turn += 1;
+                        if *my_turn == thread_num {
+                            *my_turn = 0;
+                        }
+                        cvar.notify_one();
+                        read_bytes
+                    };
+                    // We notify the condvar that the value has changed.
+
                     if bytes_count == 0 {
                         // Reached EOF.
                         return;
@@ -83,6 +108,7 @@ impl Readahead {
             block_sender.send(Block::default()).unwrap();
             handles.push(thread);
             circular_buf_channels.push((block_sender, uncompressed_receiver));
+            // Ensure there is no race condition. Wait until thread reads it's data.
         }
 
         // let (read_bufs_send, read_bufs_recv) = flume::unbounded();
