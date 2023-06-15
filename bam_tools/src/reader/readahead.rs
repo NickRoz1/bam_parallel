@@ -39,30 +39,34 @@ impl Readahead {
                 let mut read_buf = Vec::new();
 
                 for mut block in block_receiver {
-                    let (lock, cvar) = &*cond_var_for_this_thread;
-                    let mut my_turn = lock.lock().unwrap();
+                    {
+                        // Only one thread fetches data from file at a time.
+                        let (lock, cvar) = &*cond_var_for_this_thread;
+                        let mut my_turn = lock.lock().unwrap();
 
-                    while *my_turn != i {
-                        my_turn = cvar.wait(my_turn).unwrap();
+                        while *my_turn != i {
+                            my_turn = cvar.wait(my_turn).unwrap();
+                        }
+
+                        let bytes_count = fetch_block(
+                            clone_of_reader.lock().unwrap().as_mut(),
+                            &mut read_buf,
+                            &mut block,
+                        )
+                        .unwrap();
+
+                        *my_turn += 1;
+                        if *my_turn == thread_num {
+                            *my_turn = 0;
+                        }
+                        cvar.notify_all();
+                        if bytes_count == 0 {
+                            // Reached EOF.
+                            return;
+                        }
+                        // After this line the mutex lock will be dropped, and the decompression will happen in parallel to other threads.
                     }
 
-                    let bytes_count = fetch_block(
-                        clone_of_reader.lock().unwrap().as_mut(),
-                        &mut read_buf,
-                        &mut block,
-                    )
-                    .unwrap();
-
-                    *my_turn += 1;
-                    if *my_turn == thread_num {
-                        *my_turn = 0;
-                    }
-                    cvar.notify_all();
-
-                    if bytes_count == 0 {
-                        // Reached EOF.
-                        return;
-                    }
                     decompress_block(&read_buf, &mut block);
                     uncompressed_sender.send(block).unwrap();
                 }
