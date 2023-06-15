@@ -46,7 +46,7 @@ type VectorOfSendersAndReceivers = Vec<(Sender<Block>, Receiver<Block>)>;
 /// Prefetches and decompresses GBAM blocks
 pub(crate) struct Readahead {
     circular_buf_channels: VectorOfSendersAndReceivers,
-    handles: Vec<JoinHandle<()>>,
+    handles: Vec<Option<JoinHandle<()>>>,
     current_task: usize,
 }
 
@@ -56,7 +56,7 @@ impl Readahead {
 
         let mut circular_buf_channels = VectorOfSendersAndReceivers::new();
 
-        let mut handles: Vec<JoinHandle<()>> = Vec::new();
+        let mut handles: Vec<Option<JoinHandle<()>>> = Vec::new();
 
         // Due to I/O unpredictable nature, it may happen that two or more threads would race to lock a mutex on a reader
         // making uncompressed block stream unordered. Ensure order with condvar.
@@ -92,7 +92,7 @@ impl Readahead {
                         if *my_turn == thread_num {
                             *my_turn = 0;
                         }
-                        cvar.notify_one();
+                        cvar.notify_all();
                         read_bytes
                     };
                     // We notify the condvar that the value has changed.
@@ -106,7 +106,7 @@ impl Readahead {
                 }
             });
             block_sender.send(Block::default()).unwrap();
-            handles.push(thread);
+            handles.push(Some(thread));
             circular_buf_channels.push((block_sender, uncompressed_receiver));
             // Ensure there is no race condition. Wait until thread reads it's data.
         }
@@ -192,6 +192,9 @@ impl Readahead {
         let cur_thread = &mut self.circular_buf_channels[self.current_task];
         let res = cur_thread.1.recv();
         if res.is_err() {
+            for j in self.handles.drain(0..) {
+                j.unwrap().join().unwrap();
+            }
             return None;
         }
         cur_thread.0.send(old_buf).unwrap();
