@@ -249,9 +249,8 @@ fn get_seq_base(val: u32) -> char {
 }
 
 /// Decodes sequence bytes into string
-pub fn decode_seq(bytes: &[u8]) -> String {
-    let mut res = String::new();
-    res.reserve(2 * bytes.len());
+pub fn decode_seq(bytes: &[u8], res: &mut String) {
+    res.clear();
     for byte in bytes {
         let first = (byte >> 4) as u32;
         let second = (byte & 0xf) as u32;
@@ -261,5 +260,4 @@ pub fn decode_seq(bytes: &[u8]) -> String {
             res.push(get_seq_base(second));
         }
     }
-    res
 }
