@@ -6,6 +6,7 @@ use crate::MAGIC_NUMBER;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::ffi::CStr;
 use std::io;
+use std::sync::Arc;
 
 use readahead::Readahead;
 use records::Records;
@@ -19,7 +20,7 @@ pub struct Reader {
 }
 
 impl Reader {
-    pub fn new<RSS: Read + Send + 'static>(inner: RSS, mut thread_num: usize) -> Self {
+    pub fn new<RSS: Read + Send + Sync + 'static>(inner: RSS, mut thread_num: usize) -> Self {
         if thread_num > num_cpus::get() {
             thread_num = num_cpus::get();
         }
