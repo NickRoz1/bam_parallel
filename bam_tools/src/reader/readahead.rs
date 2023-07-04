@@ -7,7 +7,6 @@ use rayon::spawn;
 use std::cmp::{Ord, Ordering, PartialEq, PartialOrd};
 use std::collections::BinaryHeap;
 use std::io::Read;
-use std::sync::{Arc, Mutex};
 
 #[allow(clippy::upper_case_acronyms)]
 enum Status {
@@ -46,7 +45,6 @@ pub(crate) struct Readahead {
     // Decompressing threadpool.
     used_block_sender: Sender<Block>,
     ready_to_processing_rx: Receiver<Status>,
-    pub read_compressed_bytes: Arc<Mutex<u64>>,
 }
 
 impl Readahead {
@@ -86,8 +84,6 @@ impl Readahead {
                 }
             }
         });
-        let read_compressed_bytes: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
-        let read_compressed_bytes_clone = read_compressed_bytes.clone();
         // Reading thread.
         pool.spawn(move || {
             let mut cur_task: usize = 0;
@@ -123,7 +119,6 @@ impl Readahead {
         Self {
             used_block_sender,
             ready_to_processing_rx,
-            read_compressed_bytes,
         }
     }
 
