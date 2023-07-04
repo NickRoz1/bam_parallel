@@ -13,6 +13,7 @@ pub(crate) struct Block {
     position: u64,
     len: u64,
     data: Cursor<Vec<u8>>,
+    pub compressed_size: u64,
 }
 
 #[allow(dead_code)]

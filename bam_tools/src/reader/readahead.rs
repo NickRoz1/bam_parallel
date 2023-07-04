@@ -90,6 +90,7 @@ impl Readahead {
             while let Ok(mut block) = used_block_receiver.recv() {
                 let mut read_buf = read_bufs_recv.recv().unwrap();
                 let bytes_count = fetch_block(&mut reader, &mut read_buf, &mut block).unwrap();
+                block.compressed_size = bytes_count as u64;
 
                 let task_ready_to_sort_tx = completed_task_tx.clone();
                 if bytes_count == 0 {

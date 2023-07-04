@@ -12,22 +12,45 @@ use records::Records;
 use std::convert::TryFrom;
 use std::io::Read;
 
+use indicatif::{ProgressBar, ProgressStyle};
+
 pub struct Reader {
     readahead: Readahead,
     block_buffer: Option<Block>,
     eof_reached: bool,
+    track_progress: Option<u64>,
+    count_of_blocks: usize,
+    progress_bar: Option<ProgressBar>,
+    count_of_bytes_read: u64,
 }
 
 impl Reader {
-    pub fn new<RSS: Read + Send + 'static>(inner: RSS, mut thread_num: usize) -> Self {
+    pub fn new<RSS: Read + Send + 'static>(
+        inner: RSS,
+        mut thread_num: usize,
+        track_progress: Option<u64>,
+    ) -> Self {
         if thread_num > num_cpus::get() {
             thread_num = num_cpus::get();
         }
         let readahead = Readahead::new(thread_num, Box::new(inner));
+        let progress_bar = if let Some(bam_file_size) = track_progress {
+            let pb = ProgressBar::new(bam_file_size);
+            pb.set_style(ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+                .progress_chars("#>-"));
+            Some(pb)
+        } else {
+            None
+        };
         Self {
             readahead,
             block_buffer: Some(Block::default()),
             eof_reached: false,
+            track_progress,
+            progress_bar,
+            count_of_blocks: 0,
+            count_of_bytes_read: 0,
         }
     }
 
@@ -105,6 +128,17 @@ impl Read for Reader {
                     }
                     // New block has been read. Continue reading.
                     Some(new_block) => {
+                        const CHECK_PROGRESS_ONCE_PER_BLOCKS: usize = 1000;
+                        self.count_of_blocks += 1;
+                        self.count_of_bytes_read += new_block.compressed_size;
+                        if self.progress_bar.is_some() {
+                            if self.count_of_blocks % CHECK_PROGRESS_ONCE_PER_BLOCKS == 0 {
+                                self.progress_bar
+                                    .as_mut()
+                                    .unwrap()
+                                    .set_position(self.count_of_bytes_read);
+                            }
+                        }
                         self.block_buffer = Some(new_block);
                         // https://rust-lang.github.io/rfcs/0980-read-exact.html#about-errorkindinterrupted
                         Err(std::io::Error::from(io::ErrorKind::Interrupted))

@@ -115,10 +115,11 @@ pub fn sort_bam<R: Read + Send + 'static, W: Write>(
     reader_thread_num: usize,
     temp_files_mode: TempFilesMode,
     sort_by: SortBy,
+    bam_file_size: Option<u64>,
 ) -> std::io::Result<()> {
     let reader_thread_num = max(min(num_cpus::get(), reader_thread_num), 1);
 
-    let mut parallel_reader = Reader::new(reader, reader_thread_num);
+    let mut parallel_reader = Reader::new(reader, reader_thread_num, bam_file_size);
     parallel_reader.read_header().unwrap();
 
     let now = Instant::now();
