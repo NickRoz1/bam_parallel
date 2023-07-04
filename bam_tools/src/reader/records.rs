@@ -27,13 +27,6 @@ impl<'a> Records<'a> {
             Err(e) => Some(Err(e)),
         }
     }
-
-    /// How much compressed bytes were read from file. Only assumes continuous
-    /// reading over the BAM file. Useful for calculating progress of processing.
-    /// This function locks mutex.
-    pub fn get_amount_of_compressed_bytes_read(&mut self) -> u64 {
-        self.reader.get_amount_of_bytes_read()
-    }
 }
 
 impl<'a> Iterator for Records<'a> {
