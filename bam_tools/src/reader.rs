@@ -18,9 +18,10 @@ pub struct Reader {
     readahead: Readahead,
     block_buffer: Option<Block>,
     eof_reached: bool,
+    count_of_bytes_read: u64,
+    track_progress: Option<u64>,
     count_of_blocks: usize,
     progress_bar: Option<ProgressBar>,
-    count_of_bytes_read: u64,
 }
 
 impl Reader {
@@ -49,6 +50,7 @@ impl Reader {
             progress_bar,
             count_of_blocks: 0,
             count_of_bytes_read: 0,
+            track_progress,
         }
     }
 
@@ -93,6 +95,13 @@ impl Reader {
         }
 
         read_header(self)
+    }
+
+    /// Readahead tracks how much bytes it consumed. This information is used to
+    /// calculate progress of routines who go through whole file.
+    fn get_amount_of_bytes_read(&mut self) -> u64 {
+        let lock = self.readahead.read_compressed_bytes.lock().unwrap();
+        return *lock;
     }
 }
 
@@ -143,7 +152,20 @@ impl Read for Reader {
                     }
                 }
             }
-            Ok(n) => Ok(n),
+            Ok(n) => {
+                const CHECK_PROGRESS_ONCE_PER_BLOCKS: usize = 100;
+                if self.progress_bar.is_some() {
+                    if self.count_of_blocks % CHECK_PROGRESS_ONCE_PER_BLOCKS == 0 {
+                        let amount_read = self.get_amount_of_bytes_read();
+                        self.progress_bar
+                            .as_mut()
+                            .unwrap()
+                            .set_position(amount_read);
+                    }
+                }
+                self.count_of_blocks += 1;
+                Ok(n)
+            }
             Err(e) => Err(e),
         }
     }
