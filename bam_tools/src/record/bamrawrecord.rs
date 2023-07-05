@@ -1,7 +1,7 @@
 use super::{fields::Fields, tags::get_tag};
 use crate::{U16_SIZE, U32_SIZE, U8_SIZE};
 
-use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
+use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::borrow::Cow;
 use std::ops::{Deref, DerefMut};
 
@@ -259,5 +259,59 @@ pub fn decode_seq(bytes: &[u8], res: &mut String) {
         if second != 0 {
             res.push(get_seq_base(second));
         }
+    }
+}
+
+
+/// From NOODLES crate.
+pub fn put_sequence(mut dst: &mut [u8], read_length: usize, sequence: &String) -> std::io::Result<()>
+
+{
+    if sequence.is_empty() {
+        return Ok(());
+    }
+
+    // § 1.4.10 "`SEQ`" (2022-08-22): "If not a '*', the length of the sequence must equal the sum
+    // of lengths of `M`/`I`/`S`/`=`/`X` operations in `CIGAR`."
+    if read_length > 0 && sequence.len() != read_length {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "read length-sequence length mismatch",
+        ));
+    }
+
+    let mut bases = sequence.chars();
+
+    while let Some(l) = bases.next() {
+        // § 4.2.3 "SEQ and QUAL encoding" (2021-06-03): "When `l_seq` is odd the bottom 4 bits of
+        // the last byte are undefined, but we recommend writing these as zero."
+        let r = bases.next().unwrap_or('\0');
+        let b = encode_base(l) << 4 | encode_base(r);
+        dst.write_u8(b)?;
+    }
+
+    Ok(())
+}
+
+fn encode_base(base: char) -> u8 {
+    match base {
+        '=' => 0,
+        'A' => 1,
+        'C' => 2,
+        'M' => 3,
+        'G' => 4,
+        'R' => 5,
+        'S' => 6,
+        'V' => 7,
+        'T' => 8,
+        'W' => 9,
+        'Y' => 10,
+        'H' => 11,
+        'K' => 12,
+        'D' => 13,
+        'B' => 14,
+        // § 4.2.3 SEQ and QUAL encoding (2021-06-03): "The case-insensitive base codes ... are
+        // mapped to [0, 15] respectively with all other characters mapping to 'N' (value 15)".
+        _ => 15,
     }
 }
