@@ -20,7 +20,6 @@ use std::collections::BinaryHeap;
 use std::fs::OpenOptions;
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tempdir::TempDir;
 
@@ -394,7 +393,7 @@ impl<'a> MergeCandidate<'a> {
 }
 
 impl<'a> PartialEq for MergeCandidate<'a> {
-    fn eq(&self, other: &Self) -> bool {
+    fn eq(&self, _: &Self) -> bool {
         assert!(false);
         false
         // matches!(
