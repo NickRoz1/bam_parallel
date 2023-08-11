@@ -11,8 +11,8 @@ use std::slice::from_raw_parts;
 use std::thread;
 
 use super::comparators::{
-    compare_coordinates_and_strand, compare_read_names, compare_read_names_and_mates, extract_key,
-    KeyTuple,
+    compare_coordinates_and_strand, compare_read_names, compare_read_names_and_mates,
+    create_key_tuple, extract_key, KeyTuple,
 };
 
 use std::cmp::{max, min, Ordering};
@@ -22,7 +22,6 @@ use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 use tempdir::TempDir;
-
 static mut IO_WAIT: Duration = Duration::from_secs(0);
 
 /// This struct manages buffer for unsorted reads
@@ -89,7 +88,7 @@ impl RecordsBuffer {
 }
 
 /// Which comparator to choose for sorting
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SortBy {
     Name,
     NameAndMatchMates,
@@ -103,9 +102,40 @@ pub enum TempFilesMode {
     InMemoryBlocksLZ4,
 }
 
+/// Only coordinate sort is currently supported.
+fn do_index_sort<W: Write, IndexW: std::io::Write>(
+    bam_reader: &mut Reader,
+    mut writer: &mut W,
+    mut index_writer: &mut IndexW,
+) -> std::io::Result<()> {
+    let temp_me = Instant::now();
+    let mut records = bam_reader.records();
+    let mut all_keys: Vec<(KeyTuple, Range<usize>)> = Vec::new();
+    all_keys.reserve(500_000_000);
+    let mut i = 0;
+    while let Some(Ok(rec)) = records.next_rec() {
+        let wrapper = BAMRawRecord(Cow::Borrowed(rec));
+        let key = create_key_tuple("", &wrapper, &SortBy::CoordinatesAndStrand);
+        all_keys.push((key, i..i));
+        writer.write_all(&rec[..])?;
+        i += 1;
+    }
+
+    dbg!("The file has been converted to GBAM. Now sorting keytuples and creating the index. Curtimestamp: {}", (Instant::now()-temp_me).as_millis());
+
+    all_keys[..].par_sort_by(get_tuple_comparator(SortBy::CoordinatesAndStrand));
+
+    for (_, rng) in all_keys {
+        index_writer
+            .write_u32::<LittleEndian>(rng.start as u32)
+            .unwrap();
+    }
+    return Ok(());
+}
+
 /// Memory limit won't be strictly obeyed, but it probably won't be overflowed significantly.
 #[allow(clippy::too_many_arguments)]
-pub fn sort_bam<R: Read + Send + 'static, W: Write>(
+pub fn sort_bam<R: Read + Send + 'static, W: Write, IndexW: Write>(
     mem_limit: usize,
     reader: R,
     sorted_sink: &mut W,
@@ -113,6 +143,7 @@ pub fn sort_bam<R: Read + Send + 'static, W: Write>(
     _out_compr_level: usize,
     reader_thread_num: usize,
     temp_files_mode: TempFilesMode,
+    mut index_file_to_create: Option<IndexW>,
     sort_by: SortBy,
     bam_file_size: Option<u64>,
 ) -> std::io::Result<()> {
@@ -121,36 +152,42 @@ pub fn sort_bam<R: Read + Send + 'static, W: Write>(
     let mut parallel_reader = Reader::new(reader, reader_thread_num, bam_file_size);
     parallel_reader.read_header().unwrap();
 
-    let now = Instant::now();
-    let tmp_medium = read_split_sort_dump_chunks(
+    if let Some(mut index_file) = index_file_to_create {
+        do_index_sort(&mut parallel_reader, sorted_sink, &mut index_file)?;
+        return Ok(());
+    }
+
+    let temp_files = read_split_sort_dump_chunks::<W>(
         &mut parallel_reader,
         mem_limit,
         &tmp_dir,
         &temp_files_mode,
+        None,
         sort_by,
     );
 
     merge_sorted_chunks_and_write(
         mem_limit,
-        tmp_medium,
+        temp_files,
         sort_by,
         sorted_sink,
         &temp_files_mode,
     )?;
-    unsafe {
-        println!(
-            "Elapsed time without IO in Rust sort: {:?}",
-            now.elapsed() - IO_WAIT
-        );
-    }
+
     Ok(())
 }
 
-fn read_split_sort_dump_chunks(
+static INDEX_SORT_KEY_SIZE: usize = std::mem::size_of::<i32>()
+    + std::mem::size_of::<i32>()
+    + std::mem::size_of::<u32>()
+    + std::mem::size_of::<u8>();
+
+fn read_split_sort_dump_chunks<W: Write>(
     reader: &mut Reader,
     mem_limit: usize,
     tmp_dir: &TempDir,
     temp_files_mode: &TempFilesMode,
+    mut writer: Option<&mut W>,
     sort_by: SortBy,
 ) -> Vec<Box<dyn Read>> {
     let (work_send, work_receive) = bounded(1);
@@ -178,6 +215,13 @@ fn read_split_sort_dump_chunks(
     // While one buffer is being sorted this one will be loaded with data.
     recs_buf = Some(RecordsBuffer::new(mem_limit / 2));
 
+    // If writer exists it means we are going to index sort, immediately dumping records into sink.
+    let mut offset = writer.as_ref().map(|_| 0 as u32);
+    let mut buff_for_keys = RecordsBuffer::new(mem_limit / 2);
+    if offset.is_some() && sort_by != SortBy::CoordinatesAndStrand {
+        panic!("Index sort is only supported for coordinates and strand sort for now.");
+    }
+
     while let Ok(bytes_read) = recs_buf.as_mut().unwrap().fill(reader) {
         if bytes_read != 0 {
             let taken_buf = recs_buf.take().unwrap();
@@ -187,9 +231,48 @@ fn read_split_sort_dump_chunks(
         recs_buf = Some(result_receive.recv().unwrap());
 
         if !recs_buf.as_ref().unwrap().records.is_empty() {
+            // Dump record data into file, keep only the keys.
+            if let Some(ref mut offs) = offset {
+                let wr = writer.as_mut().unwrap();
+
+                buff_for_keys.records.clear();
+                buff_for_keys.records_bytes.clear();
+
+                let mut curs = Cursor::new(&mut buff_for_keys.records_bytes);
+
+                for (i, rec_range) in recs_buf.as_ref().unwrap().records.iter().enumerate() {
+                    wr.write_all(
+                        &recs_buf.as_ref().unwrap().records_bytes[rec_range.start..rec_range.end],
+                    )
+                    .unwrap();
+                    let rec_wrapper = BAMRawRecord(std::borrow::Cow::Borrowed(
+                        &recs_buf.as_ref().unwrap().records_bytes[rec_range.start..rec_range.end],
+                    ));
+                    let key = extract_key(
+                        &rec_wrapper,
+                        &recs_buf.as_ref().unwrap().records_bytes[rec_range.start..rec_range.end],
+                        &sort_by,
+                    );
+
+                    if let KeyTuple::CoordinatesAndStrand(refid, coord, is_reversed) = key {
+                        curs.write_i32::<LittleEndian>(refid).unwrap();
+                        curs.write_i32::<LittleEndian>(coord).unwrap();
+                        curs.write_u32::<LittleEndian>(*offs).unwrap();
+                        curs.write_u8(is_reversed as u8).unwrap();
+                    }
+
+                    buff_for_keys
+                        .records
+                        .push((i * INDEX_SORT_KEY_SIZE)..((i + 1) * INDEX_SORT_KEY_SIZE));
+                    *offs += 1;
+                }
+
+                std::mem::swap(&mut buff_for_keys, &mut recs_buf.as_mut().unwrap());
+            }
+
             match *temp_files_mode {
                 TempFilesMode::RegularFiles | TempFilesMode::LZ4CompressedFiles => {
-                    let file_name = temp_files_counter.to_string();
+                    let file_name: String = temp_files_counter.to_string();
                     let mut temp_file = make_tmp_file(&file_name, tmp_dir).unwrap();
                     dump(recs_buf.as_ref().unwrap(), &mut temp_file, temp_files_mode).unwrap();
                     temp_file.sync_all().unwrap();
@@ -199,8 +282,13 @@ fn read_split_sort_dump_chunks(
                 }
                 TempFilesMode::InMemoryBlocks | TempFilesMode::InMemoryBlocksLZ4 => {
                     let mut vec = Vec::new();
-                    // 1GB of BAM data occupies approximately 520-600 MB if compressed with LZ4.
-                    vec.reserve(MEGA_BYTE_SIZE * 640);
+                    // Don't waste memory if index sorting.
+                    if !writer.is_some() {
+                        // 1GB of BAM data occupies approximately 520-600 MB if compressed with LZ4.
+                        vec.reserve(MEGA_BYTE_SIZE * 640);
+                    } else {
+                        vec.reserve(MEGA_BYTE_SIZE * 32);
+                    }
                     let mut cursor = Cursor::new(vec);
                     dump(recs_buf.as_ref().unwrap(), &mut cursor, temp_files_mode).unwrap();
                     cursor.set_position(0);
@@ -216,7 +304,6 @@ fn read_split_sort_dump_chunks(
 
     drop(work_send);
     sort_thread_handle.join().unwrap();
-
     temp_medium
 }
 
@@ -244,14 +331,6 @@ fn dump<W: Write>(
             wrt.finish().unwrap();
         }
     }
-    // let mut buf_writer = BufWriter::new(file);
-    // if compress_temp_files {
-    //     let mut wrt = lz4_flex::frame::FrameEncoder::new(buf_writer);
-    //     write(buf, &mut wrt)?;
-    //     wrt.finish().unwrap();
-    // } else {
-    //     write(buf, &mut buf_writer)?;
-    // }
     unsafe {
         IO_WAIT += now.elapsed();
     }
@@ -260,8 +339,8 @@ fn dump<W: Write>(
 
 fn write<W: Write>(buf: &RecordsBuffer, writer: &mut W) -> std::io::Result<()> {
     for rec in &buf.records {
-        let rec_size = (rec.end - rec.start) as u64;
-        writer.write_u64::<LittleEndian>(rec_size)?;
+        let rec_size = (rec.end - rec.start) as u32;
+        writer.write_u32::<LittleEndian>(rec_size)?;
         writer.write_all(&buf.records_bytes[rec.start..rec.end])?;
     }
     Ok(())
@@ -334,7 +413,7 @@ impl ChunkReader {
     // Reads bytes from inner reader into buffer.
     pub fn load_rec(&mut self, rec_buf: &mut Vec<u8>) -> std::io::Result<ChunkReaderStatus> {
         // Needed to check whether EOF is reached.
-        let mut len_buf: [u8; 8] = [0; 8];
+        let mut len_buf: [u8; std::mem::size_of::<u32>()] = [0; std::mem::size_of::<u32>()];
         match self.inner.read_exact(&mut len_buf[..]) {
             // EOF reached.
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -343,7 +422,7 @@ impl ChunkReader {
             Ok(()) => (),
             Err(e) => return Err(e),
         }
-        let data_len = (&len_buf[..]).read_u64::<LittleEndian>()?;
+        let data_len = (&len_buf[..]).read_u32::<LittleEndian>()?;
         rec_buf.resize(data_len as usize, 0);
         self.inner.read_exact(&mut rec_buf[..])?;
         Ok(ChunkReaderStatus::LoadedRecord)
@@ -373,10 +452,9 @@ impl<'a> MergeCandidate<'a> {
         let ptr = buf.as_ptr();
         let rec_bytes = unsafe { from_raw_parts(ptr, buf.len()) };
         let rec = BAMRawRecord(Cow::Borrowed(rec_bytes));
-        let key = extract_key(&rec, rec_bytes, sort_by);
 
         Self {
-            key,
+            key: extract_key(&rec, rec_bytes, sort_by),
             buf,
             provider_idx,
             comparator,
@@ -477,7 +555,7 @@ impl<'a> NWayMerger<'a> {
     }
 
     /// Returns next record in order to merge. None if no more records left.
-    pub fn get_next_rec(&mut self, mut used_buffer: Vec<u8>) -> Option<BAMRawRecord> {
+    pub fn get_next_rec(&mut self, mut used_buffer: Vec<u8>) -> Option<Vec<u8>> {
         if self.min_heap.is_empty() {
             return None;
         }
@@ -503,7 +581,7 @@ impl<'a> NWayMerger<'a> {
                 &self.sort_by,
             )));
         }
-        Some(BAMRawRecord(Cow::Owned(cur_rec.get_data())))
+        Some(cur_rec.get_data())
     }
 }
 
@@ -522,6 +600,7 @@ fn merge_sorted_chunks_and_write<W: Write>(
     let now = Instant::now();
 
     let mut chunks_readers = Vec::new();
+
     for tmp in tmp_medium {
         match temp_files_are_compressed {
             TempFilesMode::RegularFiles => {
@@ -561,15 +640,13 @@ fn merge_sorted_chunks_and_write<W: Write>(
 
     while let Some(rec) = merger.get_next_rec(temp_buf) {
         prev = now.elapsed();
-        writer.write_all(&rec.0[..])?;
+        writer.write_all(&rec[..])?;
         unsafe {
             IO_WAIT += now.elapsed() - prev;
         }
         // Buffer rotation.
-        temp_buf = rec.0.into_owned();
+        temp_buf = rec;
     }
-
     writer.flush()?;
-
     Ok(())
 }

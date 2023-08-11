@@ -38,7 +38,11 @@ pub(crate) fn extract_key<'a>(rec: &BAMRawRecord, buf: &'a [u8], sort_by: &SortB
     create_key_tuple(name, rec, sort_by)
 }
 
-fn create_key_tuple<'a>(name: &'a str, rec: &BAMRawRecord, sort_by: &SortBy) -> KeyTuple<'a> {
+pub(crate) fn create_key_tuple<'a>(
+    name: &'a str,
+    rec: &BAMRawRecord,
+    sort_by: &SortBy,
+) -> KeyTuple<'a> {
     match *sort_by {
         SortBy::Name => KeyTuple::Name(Cow::Borrowed(name)),
         SortBy::NameAndMatchMates => {

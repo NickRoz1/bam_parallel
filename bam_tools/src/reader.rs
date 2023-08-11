@@ -18,9 +18,10 @@ pub struct Reader {
     readahead: Readahead,
     block_buffer: Option<Block>,
     eof_reached: bool,
+    count_of_bytes_read: u64,
+    track_progress: Option<u64>,
     count_of_blocks: usize,
     progress_bar: Option<ProgressBar>,
-    count_of_bytes_read: u64,
 }
 
 impl Reader {
@@ -49,6 +50,7 @@ impl Reader {
             progress_bar,
             count_of_blocks: 0,
             count_of_bytes_read: 0,
+            track_progress,
         }
     }
 
