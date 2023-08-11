@@ -12,3 +12,4 @@ bam_tools = {path = "../bam_tools"}
 md-5 = "0.9.1"
 byteorder = "1.2.3"
 num_cpus = "0.2"
+tempdir = "0.3.7"

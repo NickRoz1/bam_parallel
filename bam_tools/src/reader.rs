@@ -22,7 +22,6 @@ pub struct Reader {
     track_progress: Option<u64>,
     count_of_blocks: usize,
     progress_bar: Option<ProgressBar>,
-    count_of_bytes_read: u64,
 }
 
 impl Reader {

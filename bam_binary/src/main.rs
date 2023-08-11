@@ -4,6 +4,7 @@ use bam_tools::Reader;
 use bam_tools::MEGA_BYTE_SIZE;
 use md5::{Digest, Md5};
 use std::env;
+use tempdir::TempDir;
 
 use std::fs::File;
 use std::io::BufReader;
@@ -66,11 +67,13 @@ fn main() {
         2000 * MEGA_BYTE_SIZE,
         reader,
         &mut writer,
-        tmp_dir_path,
+        &TempDir::new_in(tmp_dir_path, "BAM sort temporary directory.").unwrap(),
         0,
         5,
         bam_tools::sorting::sort::TempFilesMode::RegularFiles,
+        Option::<File>::None,
         sort_by,
+        None,
     )
     .unwrap();
 
@@ -78,7 +81,7 @@ fn main() {
 }
 
 fn generate_file_hash<R: Read + Send + 'static>(reader: R) -> String {
-    let mut bgzf_reader = Reader::new(reader, std::cmp::min(num_cpus::get(), 20));
+    let mut bgzf_reader = Reader::new(reader, std::cmp::min(num_cpus::get(), 20), None);
 
     let mut hasher = Md5::new();
 
