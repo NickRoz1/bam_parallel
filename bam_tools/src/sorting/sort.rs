@@ -152,47 +152,28 @@ pub fn sort_bam<R: Read + Send + 'static, W: Write, IndexW: Write>(
     let mut parallel_reader = Reader::new(reader, reader_thread_num, bam_file_size);
     parallel_reader.read_header().unwrap();
 
-    let now = Instant::now();
-
-    let sort_time = Instant::now();
-    let tmp_medium = if let Some(mut index_file) = index_file_to_create {
-        do_index_sort(&mut parallel_reader, sorted_sink, &mut index_file);
-        None
-    } else {
-        Some(read_split_sort_dump_chunks::<W>(
-            &mut parallel_reader,
-            mem_limit,
-            &tmp_dir,
-            &temp_files_mode,
-            None,
-            sort_by,
-        ))
-    };
-
-    let it_took_to_sort = Instant::now() - sort_time;
-    println!("Spent in sort step: {:?}", it_took_to_sort);
-
-    let temp_me = Instant::now();
-
-    if let Some(tmp) = tmp_medium {
-        merge_sorted_chunks_and_write(
-            mem_limit,
-            tmp,
-            sort_by,
-            sorted_sink,
-            &temp_files_mode,
-            false,
-        )?;
+    if let Some(mut index_file) = index_file_to_create {
+        do_index_sort(&mut parallel_reader, sorted_sink, &mut index_file)?;
+        return Ok(());
     }
 
-    let mywait = Instant::now() - temp_me;
-    println!("Spent in merge step: {:?}", mywait);
-    unsafe {
-        println!(
-            "Elapsed time without IO in Rust sort: {:?}",
-            now.elapsed() - IO_WAIT
-        );
-    }
+    let temp_files = read_split_sort_dump_chunks::<W>(
+        &mut parallel_reader,
+        mem_limit,
+        &tmp_dir,
+        &temp_files_mode,
+        None,
+        sort_by,
+    );
+
+    merge_sorted_chunks_and_write(
+        mem_limit,
+        temp_files,
+        sort_by,
+        sorted_sink,
+        &temp_files_mode,
+    )?;
+
     Ok(())
 }
 
@@ -291,7 +272,7 @@ fn read_split_sort_dump_chunks<W: Write>(
 
             match *temp_files_mode {
                 TempFilesMode::RegularFiles | TempFilesMode::LZ4CompressedFiles => {
-                    let file_name = temp_files_counter.to_string();
+                    let file_name: String = temp_files_counter.to_string();
                     let mut temp_file = make_tmp_file(&file_name, tmp_dir).unwrap();
                     dump(recs_buf.as_ref().unwrap(), &mut temp_file, temp_files_mode).unwrap();
                     temp_file.sync_all().unwrap();
@@ -459,39 +440,24 @@ struct MergeCandidate<'a> {
     buf: Vec<u8>,
     provider_idx: usize,
     comparator: &'a Comparator,
-    index_position: Option<u32>,
 }
 
 impl<'a> MergeCandidate<'a> {
     pub fn new(
-        mut buf: Vec<u8>,
+        buf: Vec<u8>,
         provider_idx: usize,
         comparator: &'a Comparator,
         sort_by: &SortBy,
-        is_index_sort: bool,
     ) -> Self {
-        let mut index_position = None;
-        let key = if is_index_sort {
-            assert!(buf.len() == INDEX_SORT_KEY_SIZE);
-            let mut curs = Cursor::new(&mut buf);
-            let refid = curs.read_i32::<LittleEndian>().unwrap();
-            let coord = curs.read_i32::<LittleEndian>().unwrap();
-            index_position = Some(curs.read_u32::<LittleEndian>().unwrap());
-            let is_reversed = curs.read_u8().unwrap();
-            KeyTuple::CoordinatesAndStrand(refid, coord, is_reversed != 0)
-        } else {
-            let ptr = buf.as_ptr();
-            let rec_bytes = unsafe { from_raw_parts(ptr, buf.len()) };
-            let rec = BAMRawRecord(Cow::Borrowed(rec_bytes));
-            extract_key(&rec, rec_bytes, sort_by)
-        };
+        let ptr = buf.as_ptr();
+        let rec_bytes = unsafe { from_raw_parts(ptr, buf.len()) };
+        let rec = BAMRawRecord(Cow::Borrowed(rec_bytes));
 
         Self {
-            key,
+            key: extract_key(&rec, rec_bytes, sort_by),
             buf,
             provider_idx,
             comparator,
-            index_position,
         }
     }
 
@@ -551,7 +517,6 @@ struct NWayMerger<'a> {
     // inside themselves).
     min_heap: BinaryHeap<Reverse<MergeCandidate<'a>>>,
     sort_by: SortBy,
-    is_index_sort: bool,
 }
 
 impl<'a> NWayMerger<'a> {
@@ -559,7 +524,6 @@ impl<'a> NWayMerger<'a> {
         chunks_readers: Vec<ChunkReader>,
         comparator: &'a Comparator,
         sort_by: SortBy,
-        is_index_sort: bool,
     ) -> Self {
         let mut min_heap = BinaryHeap::new();
         let mut providers = Vec::<ChunkReader>::new();
@@ -576,7 +540,6 @@ impl<'a> NWayMerger<'a> {
                         provider_idx,
                         comparator,
                         &sort_by,
-                        is_index_sort,
                     )));
                     providers.push(chunk_reader);
                     provider_idx += 1;
@@ -588,7 +551,6 @@ impl<'a> NWayMerger<'a> {
             providers,
             min_heap,
             sort_by,
-            is_index_sort,
         }
     }
 
@@ -617,7 +579,6 @@ impl<'a> NWayMerger<'a> {
                 rec_provider_idx,
                 rec_comparator,
                 &self.sort_by,
-                self.is_index_sort,
             )));
         }
         Some(cur_rec.get_data())
@@ -632,7 +593,6 @@ fn merge_sorted_chunks_and_write<W: Write>(
     sort_by: SortBy,
     writer: &mut W,
     temp_files_are_compressed: &TempFilesMode,
-    is_index_sort: bool,
 ) -> std::io::Result<()> {
     let num_chunks = tmp_medium.len();
     let input_buf_mem_limit = min(16 * MEGA_BYTE_SIZE, mem_limit / 4 / num_chunks);
@@ -640,9 +600,6 @@ fn merge_sorted_chunks_and_write<W: Write>(
     let now = Instant::now();
 
     let mut chunks_readers = Vec::new();
-    dbg!(is_index_sort);
-    dbg!(tmp_medium.len());
-    let mut what = Instant::now();
 
     for tmp in tmp_medium {
         match temp_files_are_compressed {
@@ -672,49 +629,24 @@ fn merge_sorted_chunks_and_write<W: Write>(
     }
 
     let comparator = get_comparator(sort_by);
-    let mut merger = NWayMerger::new(chunks_readers, &comparator, sort_by, is_index_sort);
-
-    let ch = (Instant::now() - what);
+    let mut merger = NWayMerger::new(chunks_readers, &comparator, sort_by);
 
     let mut temp_buf = Vec::<u8>::new();
-    dbg!(ch.as_millis());
+
     unsafe {
         IO_WAIT += now.elapsed();
     }
     let mut prev;
 
-    let mut count_merge_cost = Instant::now();
-    let mut count_here: Duration = Duration::new(0, 0);
     while let Some(rec) = merger.get_next_rec(temp_buf) {
-        let t = Instant::now();
-        let bytes = if is_index_sort {
-            // This is the index of a record, which stands on this position.
-            // First u32 in index file may be 21512512. It means that first
-            // record in GBAM file is 21512512's record in sorted order.
-            &rec[(std::mem::size_of::<i32>() + std::mem::size_of::<i32>())
-                ..(std::mem::size_of::<i32>()
-                    + std::mem::size_of::<i32>()
-                    + std::mem::size_of::<u32>())]
-        } else {
-            // This is BAM record
-            &rec[..]
-        };
         prev = now.elapsed();
-        writer.write_all(bytes)?;
+        writer.write_all(&rec[..])?;
         unsafe {
             IO_WAIT += now.elapsed() - prev;
         }
         // Buffer rotation.
         temp_buf = rec;
-        count_here += Instant::now() - t;
     }
-    let mut dr = Instant::now() - count_merge_cost;
-    dr -= count_here;
-    dbg!(dr.as_millis());
-    dbg!(count_here.as_millis());
-    let mut last_check = Instant::now();
     writer.flush()?;
-    let cvxcv = Instant::now() - last_check;
-    dbg!(cvxcv.as_millis());
     Ok(())
 }
